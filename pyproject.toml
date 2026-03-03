@@ -1,0 +1,37 @@
+[project]
+name = "bigtable-data-source"
+version = "0.1.0"
+description = "Python Data Source for Google Cloud Bigtable Change Streams"
+authors = [
+    {name = "Matt Slack"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+]
+
+[tool.poetry.group.test.dependencies]
+pytest = "^9.0.2"
+pytest-cov = "^7.0.0"
+pytest-spark = "^0.8.0"
+google-cloud-bigtable = "^2.28.0"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.14.9"
+pyspark = {extras = ["sql,connect"], version = "4.1.1"}
+grpcio = ">=1.76.0"
+grpcio-status = ">=1.76.0"
+googleapis-common-protos = ">=1.71.0"
+mypy = "^1.19.0"
+pyarrow = "^22.0.0"
+python-dotenv = "^1.0.0"
+
+[tool.poetry]
+packages = [{include = "bigtable_data_source", from = "src"}]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
