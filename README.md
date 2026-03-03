@@ -96,6 +96,7 @@ changes = spark.readStream \
 |--------|----------|---------|-------------|
 | `batch_duration_seconds` | No | `10` | Target duration per micro-batch |
 | `max_rows_per_partition` | No | `5000` | Max mutations to read per partition per batch |
+| `start_timestamp` | No | (now) | When no checkpoint exists, start from this time: ISO 8601 (e.g. `2025-03-01T00:00:00Z`) or Unix seconds. Ignored when resuming with a checkpoint. |
 
 ## Schema
 

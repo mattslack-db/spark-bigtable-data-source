@@ -293,3 +293,210 @@ def test_parse_mutation_unknown_type(basic_options):
     result = reader._parse_mutation(chunk, chunk.row_key, ts, ts, partition)
 
     assert result is None
+
+
+# ─── start_timestamp option ─────────────────────────────────────────────────
+
+
+def test_parse_start_timestamp_none():
+    """_parse_start_timestamp returns None when value is None."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    assert BigtableStreamReader._parse_start_timestamp(None) is None
+
+
+def test_parse_start_timestamp_empty_string():
+    """_parse_start_timestamp returns None for empty or whitespace string."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    assert BigtableStreamReader._parse_start_timestamp("") is None
+    assert BigtableStreamReader._parse_start_timestamp("   ") is None
+
+
+def test_parse_start_timestamp_iso_utc():
+    """_parse_start_timestamp parses ISO 8601 with Z as UTC."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    dt = BigtableStreamReader._parse_start_timestamp("2025-03-01T12:00:00Z")
+    assert dt is not None
+    assert dt.year == 2025 and dt.month == 3 and dt.day == 1
+    assert dt.hour == 12 and dt.minute == 0 and dt.second == 0
+    assert dt.tzinfo == timezone.utc
+
+
+def test_parse_start_timestamp_iso_naive_treated_as_utc():
+    """_parse_start_timestamp treats naive ISO datetime as UTC."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    dt = BigtableStreamReader._parse_start_timestamp("2025-03-01T12:00:00")
+    assert dt is not None
+    assert dt.tzinfo == timezone.utc
+    assert dt.hour == 12
+
+
+def test_parse_start_timestamp_unix_int():
+    """_parse_start_timestamp accepts Unix timestamp (int) in seconds."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    # 2025-03-01 12:00:00 UTC
+    unix_ts = 1740823200
+    dt = BigtableStreamReader._parse_start_timestamp(unix_ts)
+    assert dt is not None
+    assert dt.tzinfo == timezone.utc
+    assert int(dt.timestamp()) == unix_ts
+
+
+def test_parse_start_timestamp_unix_float():
+    """_parse_start_timestamp accepts Unix timestamp (float) in seconds."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    dt = BigtableStreamReader._parse_start_timestamp(1740823200.5)
+    assert dt is not None
+    assert dt.tzinfo == timezone.utc
+    assert dt.second == 0
+    assert dt.microsecond == 500_000
+
+
+def test_stream_reader_init_stores_start_timestamp(basic_options):
+    """Reader stores _start_timestamp when start_timestamp option is set."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    basic_options["start_timestamp"] = "2025-03-01T00:00:00Z"
+    reader = BigtableStreamReader(basic_options)
+    assert reader._start_timestamp is not None
+    assert reader._start_timestamp.year == 2025 and reader._start_timestamp.month == 3
+
+
+def test_stream_reader_init_no_start_timestamp_by_default(basic_options):
+    """Reader has _start_timestamp None when option is not set."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    assert reader._start_timestamp is None
+
+
+def test_read_partition_chunk_uses_start_timestamp_when_no_token(basic_options):
+    """When no continuation token, _read_partition_chunk sets request start_time from start_timestamp."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    options = {**basic_options, "start_timestamp": "2025-03-01T12:00:00Z"}
+    reader = BigtableStreamReader(options)
+    reader._tokens = {}  # no token
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+
+    captured_request = None
+
+    def fake_read_change_stream(request=None):
+        nonlocal captured_request
+        captured_request = request
+        # Yield a heartbeat so the loop exits (3 heartbeats with no data)
+        hb = MagicMock()
+        hb.estimated_low_watermark = None
+        hb.continuation_token = MagicMock()
+        hb.continuation_token.token = "next-token"
+        response = MagicMock()
+        response.heartbeat = hb
+        response.close_stream = None
+        response.data_change = None
+        for _ in range(3):
+            yield response
+        return
+
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = fake_read_change_stream
+
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        rows, new_token = reader._read_partition_chunk(partition)
+
+    assert captured_request is not None
+    assert "start_time" in captured_request
+    assert reader._start_timestamp is not None
+    assert captured_request["start_time"].seconds == int(reader._start_timestamp.timestamp())
+    assert captured_request["start_time"].nanos == 0
+    assert new_token == "next-token"
+
+
+def test_read_partition_chunk_uses_now_when_no_start_timestamp(basic_options):
+    """When no token and no start_timestamp, request uses current time (we only assert start_time is set)."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._tokens = {}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+
+    captured_request = None
+
+    def fake_read_change_stream(request=None):
+        nonlocal captured_request
+        captured_request = request
+        hb = MagicMock()
+        hb.estimated_low_watermark = None
+        hb.continuation_token = MagicMock()
+        hb.continuation_token.token = "t"
+        response = MagicMock()
+        response.heartbeat = hb
+        response.close_stream = None
+        response.data_change = None
+        for _ in range(3):
+            yield response
+        return
+
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = fake_read_change_stream
+
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        reader._read_partition_chunk(partition)
+
+    assert captured_request is not None
+    assert "start_time" in captured_request
+    assert captured_request["start_time"].seconds >= 0
+
+
+def test_read_partition_chunk_uses_continuation_token_when_provided(basic_options):
+    """When a continuation token is set for the partition, request uses continuation_tokens and no start_time."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._tokens = {0: "saved-continuation-token"}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+
+    captured_request = None
+
+    def fake_read_change_stream(request=None):
+        nonlocal captured_request
+        captured_request = request
+        hb = MagicMock()
+        hb.estimated_low_watermark = None
+        hb.continuation_token = MagicMock()
+        hb.continuation_token.token = "next-token"
+        response = MagicMock()
+        response.heartbeat = hb
+        response.close_stream = None
+        response.data_change = None
+        for _ in range(3):
+            yield response
+        return
+
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = fake_read_change_stream
+
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        rows, new_token = reader._read_partition_chunk(partition)
+
+    assert captured_request is not None
+    assert "continuation_tokens" in captured_request
+    tokens_cfg = captured_request["continuation_tokens"]
+    assert "tokens" in tokens_cfg
+    assert len(tokens_cfg["tokens"]) == 1
+    assert tokens_cfg["tokens"][0]["token"] == "saved-continuation-token"
+    assert "start_time" not in captured_request
+    assert new_token == "next-token"

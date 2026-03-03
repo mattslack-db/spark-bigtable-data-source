@@ -1,6 +1,6 @@
 """Bigtable Change Stream reader implementation."""
 
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Iterator, List, Optional
 
 from pyspark.sql.datasource import DataSourceStreamReader
@@ -33,11 +33,14 @@ class BigtableStreamReader:
       3. partitions()     — return BigtablePartition objects for the batch
       4. read(partition)  — yield rows from that partition's buffered data
 
-    Optional option:
+    Optional options:
       credentials_json: JSON string of a GCP service account key dict. If set,
         credentials are created via google.oauth2.service_account.Credentials
         .from_service_account_info(); otherwise application default credentials
         are used (e.g. GOOGLE_APPLICATION_CREDENTIALS or ADC).
+      start_timestamp: When no continuation token is set, start the change stream
+        from this time instead of "now". ISO 8601 string (e.g. "2025-03-01T00:00:00Z")
+        or Unix timestamp (seconds). Ignored when resuming with a token.
     """
 
     def __init__(self, options):
@@ -61,6 +64,10 @@ class BigtableStreamReader:
         self.max_rows_per_partition = int(options.get("max_rows_per_partition", "5000"))
         # Optional: JSON string of service account key dict; if set, use it instead of ADC
         self._credentials_json = options.get("credentials_json")
+        # Optional: when no continuation token, start from this time (ISO 8601 str or Unix seconds)
+        self._start_timestamp: Optional[datetime] = self._parse_start_timestamp(
+            options.get("start_timestamp")
+        )
         self.options = options
 
         # partition_index → list of row dicts
@@ -80,6 +87,24 @@ class BigtableStreamReader:
         missing = [opt for opt in required if opt not in options]
         if missing:
             raise ValueError(f"Missing required options: {', '.join(missing)}")
+
+    @staticmethod
+    def _parse_start_timestamp(value) -> Optional[datetime]:
+        """Parse start_timestamp option to UTC datetime, or None if not set."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        s = str(value).strip()
+        if not s:
+            return None
+        # ISO 8601: allow Z or +00:00 for UTC
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _get_client(self):
         """Lazily create the Bigtable client and table reference."""
@@ -260,9 +285,17 @@ class BigtableStreamReader:
                 ]
             }
         else:
-            now_ts = Timestamp()
-            now_ts.GetCurrentTime()
-            request["start_time"] = now_ts
+            if self._start_timestamp is not None:
+                start_ts = Timestamp()
+                start_ts.seconds = int(self._start_timestamp.timestamp())
+                start_ts.nanos = int(
+                    (self._start_timestamp.timestamp() % 1) * 1_000_000_000
+                )
+                request["start_time"] = start_ts
+            else:
+                now_ts = Timestamp()
+                now_ts.GetCurrentTime()
+                request["start_time"] = now_ts
 
         data_client = table._instance._client.table_data_client
 
