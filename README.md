@@ -11,6 +11,7 @@ Python Data Source for Apache Spark enabling streaming reads from Google Cloud B
 * **Tablet Split/Merge Handling**: Detects CloseStream events and re-discovers partitions
 * **Watermark Support**: Exposes `low_watermark` from heartbeats for Spark `withWatermark()`
 * **Fixed Schema**: All change stream events use a consistent 8-column schema
+* **Stateful processor**: Reconstruct full row state per key from the change stream via `transformWithState` (Spark 4.x)
 
 ## Installation
 
@@ -78,6 +79,43 @@ changes = spark.readStream \
     .option("max_rows_per_partition", "10000") \
     .load()
 ```
+
+### Reconstruct full records with transformWithState
+
+The **stateful processor** reconstructs the latest row state per `row_key` from the change stream: it keeps a map of **column_family → latest value** in state and emits one row `(row_key, record)` on every change. Use `BigtableReconstructProcessor` and `RECONSTRUCTED_RECORD_SCHEMA` from `bigtable_stateful_processor`. **Requires Spark 4.x** and a RocksDB state store (e.g. Databricks Runtime with `transformWithState` support).
+
+```python
+spark.conf.set(
+    "spark.sql.streaming.stateStore.providerClass",
+    "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider",
+)
+
+from bigtable_stateful_processor import BigtableReconstructProcessor, RECONSTRUCTED_RECORD_SCHEMA
+
+changes = spark.readStream.format("bigtable_changes").options(**common_options).load()
+
+reconstructed = (
+    changes.groupBy("row_key")
+    .transformWithState(
+        statefulProcessor=BigtableReconstructProcessor(),
+        outputStructType=RECONSTRUCTED_RECORD_SCHEMA,
+        outputMode="Update",
+        timeMode="None",
+    )
+)
+
+query = reconstructed.writeStream \
+    .format("memory") \
+    .queryName("bt_reconstructed") \
+    .outputMode("update") \
+    .option("checkpointLocation", "/tmp/bt_reconstruct_checkpoint") \
+    .trigger(processingTime="10 seconds") \
+    .start()
+
+# Query: spark.table("bt_reconstructed").show(20, truncate=60)
+```
+
+See `stream-demo.ipynb` and `examples.ipynb` for full examples.
 
 ## Configuration Options
 

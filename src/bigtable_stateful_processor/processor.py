@@ -1,0 +1,114 @@
+"""
+Stateful processor that consumes bigtable_changes and reconstructs the full row record.
+
+Uses row_key as the grouping key. State is a MapState: key = column_family (string),
+value = latest value (bytes) for that family. On each new change, state is updated and
+one output row is emitted with row_key and the full record (map of column_family -> value).
+
+Example usage with the bigtable_changes stream::
+
+    from pyspark.sql import SparkSession
+    from bigtable_stateful_processor import BigtableReconstructProcessor, RECONSTRUCTED_RECORD_SCHEMA
+
+    spark = SparkSession.builder.getOrCreate()
+    changes = (
+        spark.readStream.format("bigtable_changes")
+        .option("project_id", "...")
+        .option("instance_id", "...")
+        .option("table_id", "...")
+        .load()
+    )
+    reconstructed = (
+        changes.groupBy("row_key")
+        .transformWithState(
+            statefulProcessor=BigtableReconstructProcessor(),
+            outputStructType=RECONSTRUCTED_RECORD_SCHEMA,
+            outputMode="Update",
+            timeMode="None",
+        )
+    )
+    reconstructed.writeStream.outputMode("update").format("console").start()
+"""
+
+from typing import Any, Iterator, Optional
+
+from pyspark.sql import Row
+from pyspark.sql.streaming.stateful_processor import (
+    StatefulProcessor,
+    StatefulProcessorHandle,
+    TimerValues,
+)
+from pyspark.sql.types import BinaryType, StringType, StructType
+
+# MapState: key = column_family (single string), value = latest value (bytes)
+_MAP_KEY_SCHEMA = StructType().add("column_family", StringType())
+_MAP_VALUE_SCHEMA = StructType().add("value", BinaryType())
+
+
+class BigtableReconstructProcessor(StatefulProcessor):
+    """
+    Reconstructs the full Bigtable row from change stream events.
+
+    State: MapState from column_family (string) to latest value (binary).
+    When any new change arrives for a row_key, state is updated and an output row
+    is emitted with row_key and the full record (all column families' latest values).
+    """
+
+    def init(self, handle: StatefulProcessorHandle) -> None:
+        self._handle = handle
+        self._cells = handle.getMapState(
+            "cells",
+            userKeySchema=_MAP_KEY_SCHEMA,
+            valueSchema=_MAP_VALUE_SCHEMA,
+        )
+
+    def handleInputRows(
+        self,
+        key: Any,
+        rows: Iterator[Row],
+        timerValues: TimerValues,
+    ) -> Iterator[Row]:
+        row_key = _extract_row_key(key)
+        for row in rows:
+            cf = row.column_family
+            if not isinstance(cf, str):
+                cf = cf.decode("utf-8") if cf else ""
+            map_key = (cf,)
+            mutation_type = (row.mutation_type or "").strip().upper()
+            if mutation_type == "SET_CELL":
+                value = row.value if row.value is not None else b""
+                self._cells.updateValue(map_key, (value,))
+            elif mutation_type == "DELETE_ROW":
+                self._cells.clear()
+            elif mutation_type in ("DELETE_COLUMN", "DELETE_FAMILY"):
+                if self._cells.containsKey(map_key):
+                    self._cells.removeKey(map_key)
+            # else: ignore unknown mutation type
+
+        record = _build_record_from_state(self._cells)
+        yield Row(row_key=row_key, record=record)
+
+    def close(self) -> None:
+        pass
+
+
+def _extract_row_key(key: Any) -> bytes:
+    if isinstance(key, bytes):
+        return key
+    if isinstance(key, (tuple, list)) and len(key) >= 1:
+        return key[0]
+    if hasattr(key, "row_key"):
+        return key.row_key
+    if hasattr(key, "__getitem__"):
+        return key[0]
+    return key
+
+
+def _build_record_from_state(cells) -> dict:
+    """Build record map (column_family -> value bytes) from MapState."""
+    record = {}
+    for map_key_tuple, value_tuple in cells.iterator():
+        cf = map_key_tuple[0] if map_key_tuple else ""
+        val = value_tuple[0] if value_tuple else b""
+        record[cf] = val
+    return record

@@ -27,7 +27,10 @@ pyarrow = "^22.0.0"
 python-dotenv = "^1.0.0"
 
 [tool.poetry]
-packages = [{include = "bigtable_data_source", from = "src"}]
+packages = [
+    {include = "bigtable_data_source", from = "src"},
+    {include = "bigtable_stateful_processor", from = "src"},
+]
 
 [tool.mypy]
 ignore_missing_imports = true
