@@ -2,6 +2,10 @@
 
 Python Data Source for Apache Spark enabling streaming reads from Google Cloud Bigtable Change Streams.
 
+### What this solves
+
+Many pipelines today copy or export Bigtable data into a separate cluster (e.g. Databricks via DataProc, or a GCS snapshot) so Spark can process it. That adds extra moving parts: export jobs, staging storage, and duplicated data. This data source **reads Bigtable Change Streams directly** from your Spark environment (Databricks, EMR, or any Spark 4.x cluster). You get a single, simpler architecture: Bigtable → Spark Structured Streaming → Delta (or other sinks), without standing up DataProc or copying data into an intermediate system. Change stream events are consumed as a native streaming source with exactly-once semantics and backpressure.
+
 ## Features
 
 * **Streaming Reads**: Consume Bigtable Change Streams as a Spark Structured Streaming source
