@@ -33,7 +33,8 @@ def test_data_source_schema_returns_fixed_schema():
     assert "value" in field_names
     assert "mutation_type" in field_names
     assert "commit_timestamp" in field_names
-    assert "partition_key" in field_names
+    assert "partition_start_key" in field_names
+    assert "partition_end_key" in field_names
     assert "low_watermark" in field_names
 
 

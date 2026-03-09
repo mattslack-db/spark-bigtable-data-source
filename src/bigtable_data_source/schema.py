@@ -15,6 +15,7 @@ CHANGE_STREAM_SCHEMA = (
     .add("value", BinaryType())
     .add("mutation_type", StringType())
     .add("commit_timestamp", TimestampType())
-    .add("partition_key", StringType())
+    .add("partition_start_key", BinaryType())
+    .add("partition_end_key", BinaryType())
     .add("low_watermark", TimestampType())
 )

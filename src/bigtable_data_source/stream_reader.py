@@ -197,7 +197,8 @@ class BigtableStreamReader:
                 row["value"],
                 row["mutation_type"],
                 row["commit_timestamp"],
-                row["partition_key"],
+                row["partition_start_key"],
+                row["partition_end_key"],
                 row["low_watermark"],
             )
 
@@ -381,7 +382,8 @@ class BigtableStreamReader:
             "value": value,
             "mutation_type": mutation_type,
             "commit_timestamp": commit_ts,
-            "partition_key": f"{partition.start_key!r}-{partition.end_key!r}",
+            "partition_start_key": partition.start_key,
+            "partition_end_key": partition.end_key,
             "low_watermark": low_wm,
         }
 

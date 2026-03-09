@@ -49,7 +49,8 @@ changes.printSchema()
 #  |-- value: binary
 #  |-- mutation_type: string
 #  |-- commit_timestamp: timestamp
-#  |-- partition_key: string
+#  |-- partition_start_key: binary
+#  |-- partition_end_key: binary
 #  |-- low_watermark: timestamp
 ```
 
@@ -119,6 +120,28 @@ query = reconstructed.writeStream \
 # Query: spark.table("bt_reconstructed").show(20, truncate=60)
 ```
 
+#### Loading initial state from a Delta table
+
+You can preload state from a Delta table (e.g. a previous run’s reconstructed output or an exported snapshot) so the processor starts from existing row state instead of empty. The table must have a `record` column (map of column family → value, same as `RECONSTRUCTED_RECORD_SCHEMA`). Pass the initial state as a **GroupedData** with the same grouping key as the stream (`groupBy("row_key")`).
+
+```python
+# Load initial state from a Delta table (schema: row_key, record), then group by key
+initial_state = spark.read.table("catalog.schema.bt_reconstructed").groupBy("row_key")
+
+reconstructed = (
+    changes.groupBy("row_key")
+    .transformWithState(
+        statefulProcessor=BigtableReconstructProcessor(),
+        outputStructType=RECONSTRUCTED_RECORD_SCHEMA,
+        outputMode="Update",
+        timeMode="None",
+        initialState=initial_state,
+    )
+)
+```
+
+Use this to resume from a saved snapshot, migrate from another pipeline, or bootstrap state from a batch export.
+
 See `stream-demo.ipynb` and `examples.ipynb` for full examples.
 
 ## Configuration Options
@@ -152,7 +175,8 @@ All change stream events are exposed with this fixed schema:
 | `value` | `BinaryType` | Cell value (empty for deletes) |
 | `mutation_type` | `StringType` | One of: `SET_CELL`, `DELETE_COLUMN`, `DELETE_FAMILY`, `DELETE_ROW` |
 | `commit_timestamp` | `TimestampType` | When the mutation was committed |
-| `partition_key` | `StringType` | Which tablet partition this came from |
+| `partition_start_key` | `BinaryType` | Start key (inclusive) of the tablet partition |
+| `partition_end_key` | `BinaryType` | End key (exclusive) of the tablet partition; empty means end of table |
 | `low_watermark` | `TimestampType` | Safe-to-process-up-to watermark |
 
 ## Testing with Synthetic Data

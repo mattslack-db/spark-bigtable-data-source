@@ -159,7 +159,8 @@ def test_read_yields_buffered_rows(basic_options):
         "value": b"val1",
         "mutation_type": "SET_CELL",
         "commit_timestamp": ts,
-        "partition_key": "b''-b'row-500'",
+        "partition_start_key": b"",
+        "partition_end_key": b"row-500",
         "low_watermark": ts,
     }
     partition = BigtablePartition(0, b"", b"row-500", None, rows=[row_dict])
@@ -173,7 +174,8 @@ def test_read_yields_buffered_rows(basic_options):
         b"val1",
         "SET_CELL",
         ts,
-        "b''-b'row-500'",
+        b"",
+        b"row-500",
         ts,
     )
 

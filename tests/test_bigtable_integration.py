@@ -140,7 +140,7 @@ def test_bigtable_synthetic_data_and_stream_read(spark, bigtable_ready):
         "Check Bigtable change stream is enabled and retention is set."
     )
 
-    # Schema: row_key, column_family, column_qualifier, value, mutation_type, commit_timestamp, partition_key, low_watermark
+    # Schema: row_key, column_family, column_qualifier, value, mutation_type, commit_timestamp, partition_start_key, partition_end_key, low_watermark
     set_cells = [r for r in rows if r.mutation_type == "SET_CELL"]
     assert len(set_cells) >= 1, (
         f"Expected at least 1 SET_CELL mutation, got {len(set_cells)}. "
@@ -452,3 +452,151 @@ def test_stateful_processor_reconstructs_record_from_change_stream(spark, bigtab
             "Reconstructed rows should have row_key and record"
         )
         assert isinstance(r.record, dict), "record should be a dict"
+
+
+@pytest.mark.integration
+def test_stateful_processor_initial_state_load_from_dataframe(spark, bigtable_ready):
+    """
+    Run transformWithState with initialState: preload state for a row, then
+    write change stream events for that row. Assert the output shows initial state merged
+    with stream updates (e.g. a column family only in initial state is preserved).
+    """
+    pytest.importorskip("pandas", minversion="2.2.0")
+    config = bigtable_ready
+    project_id = config["project_id"]
+    instance_id = config["instance_id"]
+    table_id = config["table_id"]
+    column_family = config["column_family"]
+
+    try:
+        spark.conf.set(
+            "spark.sql.streaming.stateStore.providerClass",
+            "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider",
+        )
+    except Exception:
+        pytest.skip(
+            "transformWithState integration test requires RocksDB state store "
+            "(Spark 4.x with RocksDBStateStoreProvider)"
+        )
+
+    from bigtable_stateful_processor import (
+        BigtableReconstructProcessor,
+        RECONSTRUCTED_RECORD_SCHEMA,
+    )
+    from pyspark.sql import Row
+
+    stream_options = {
+        "project_id": project_id,
+        "instance_id": instance_id,
+        "table_id": table_id,
+        "app_profile_id": "default",
+        "max_rows_per_partition": "5000",
+    }
+
+    query_name = "bt_stateful_initial_load"
+    trigger_interval = "15 seconds"
+    wait_after_writes = 120
+    row_key = b"initial-load-row"
+
+    # Initial state: one row with two "column families" in record. We use the real
+    # column_family (will be overwritten by stream) and a synthetic key only in initial
+    # state; the stream never writes to the latter, so it proves initial state was loaded.
+    initial_record = {
+        column_family: b"preloaded-will-be-overwritten",
+        "cf_initial_only": b"from-initial-state",
+    }
+    initial_state_df = spark.createDataFrame(
+        [Row(row_key=row_key, record=initial_record)],
+        schema=RECONSTRUCTED_RECORD_SCHEMA,
+    )
+    # transformWithState expects initialState to be GroupedData (same key as stream)
+    initial_state_grouped = initial_state_df.groupBy("row_key")
+
+    changes = (
+        spark.readStream.format("bigtable_changes")
+        .options(**stream_options)
+        .load()
+    )
+    reconstructed = (
+        changes.groupBy("row_key")
+        .transformWithState(
+            statefulProcessor=BigtableReconstructProcessor(),
+            outputStructType=RECONSTRUCTED_RECORD_SCHEMA,
+            outputMode="Update",
+            timeMode="None",
+            initialState=initial_state_grouped,
+        )
+    )
+    query = (
+        reconstructed.writeStream.format("memory")
+        .queryName(query_name)
+        .outputMode("update")
+        .trigger(processingTime=trigger_interval)
+        .start()
+    )
+
+    def run_stream():
+        query.awaitTermination()
+
+    stream_thread = threading.Thread(target=run_stream, daemon=True)
+    stream_thread.start()
+    time.sleep(5)
+
+    write_synthetic_mutations(
+        project_id=project_id,
+        instance_id=instance_id,
+        table_id=table_id,
+        column_family=column_family,
+        count=3,
+        row_key=row_key,
+        column=b"payload",
+    )
+
+    for _ in range(wait_after_writes // 5):
+        time.sleep(5)
+        try:
+            n = spark.table(query_name).count()
+            if n >= 1:
+                break
+        except Exception:
+            pass
+    else:
+        time.sleep(5)
+
+    try:
+        query.stop()
+    except Exception:
+        pass
+    stream_thread.join(timeout=30)
+
+    result = spark.table(query_name)
+    rows = result.collect()
+
+    if len(rows) == 0:
+        pytest.skip(
+            "Stateful processor (with initial state) produced no rows in time. "
+            "Run with longer wait or fewer tablets."
+        )
+
+    our_rows = [r for r in rows if r.row_key == row_key]
+    if len(our_rows) >= 1:
+        r = our_rows[0]
+        assert hasattr(r, "record") and isinstance(r.record, dict)
+        # Stream updated this column family
+        assert column_family in r.record, (
+            f"record should contain column family {column_family!r}, keys: {list(r.record.keys())!r}"
+        )
+        assert b"integration-test-" in r.record[column_family], (
+            f"record[{column_family!r}] should reflect stream write, got: {r.record[column_family][:80]!r}..."
+        )
+        # Initial state had this key; stream never writes to it, so it must come from initial load
+        assert "cf_initial_only" in r.record, (
+            "record should contain cf_initial_only from initial state (proves initial load was applied)"
+        )
+        assert r.record["cf_initial_only"] == b"from-initial-state", (
+            f"cf_initial_only should be from initial state, got {r.record['cf_initial_only']!r}"
+        )
+    else:
+        r = rows[0]
+        assert hasattr(r, "row_key") and hasattr(r, "record")
+        assert isinstance(r.record, dict)

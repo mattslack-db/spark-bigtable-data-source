@@ -55,7 +55,7 @@ Documentation about Google Cloud Bigtable is available at:
 
 4. **Schema** (`schema.py`): Fixed schema for change stream events
    - `CHANGE_STREAM_SCHEMA` with row_key, column_family, column_qualifier, value,
-     mutation_type, commit_timestamp, partition_key, low_watermark
+     mutation_type, commit_timestamp, partition_start_key, partition_end_key, low_watermark
 
 5. **Partitioning** (`partitioning.py`): Bigtable tablet partition representation
    - `BigtablePartition(InputPartition)` with partition_index, start_key, end_key, token

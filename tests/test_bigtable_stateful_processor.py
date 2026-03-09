@@ -125,7 +125,8 @@ def test_handle_input_rows_set_cell_emits_full_record():
         value=b"value1",
         mutation_type="SET_CELL",
         commit_timestamp=None,
-        partition_key="",
+        partition_start_key=b"",
+        partition_end_key=b"",
         low_watermark=None,
     )
     timer = MagicMock()
@@ -148,9 +149,11 @@ def test_handle_input_rows_two_families_emits_combined_record():
 
     rows = [
         Row(row_key=b"r1", column_family="cf1", column_qualifier=b"q1", value=b"v1",
-            mutation_type="SET_CELL", commit_timestamp=None, partition_key="", low_watermark=None),
+            mutation_type="SET_CELL", commit_timestamp=None, partition_start_key=b"",
+        partition_end_key=b"", low_watermark=None),
         Row(row_key=b"r1", column_family="cf2", column_qualifier=b"q2", value=b"v2",
-            mutation_type="SET_CELL", commit_timestamp=None, partition_key="", low_watermark=None),
+            mutation_type="SET_CELL", commit_timestamp=None, partition_start_key=b"",
+        partition_end_key=b"", low_watermark=None),
     ]
     timer = MagicMock()
     out = list(processor.handleInputRows(b"r1", iter(rows), timer))
@@ -172,7 +175,8 @@ def test_handle_input_rows_delete_family_removes_entry():
     processor._cells = mock_cells
 
     row = Row(row_key=b"r1", column_family="cf1", column_qualifier=b"q1", value=b"",
-              mutation_type="DELETE_FAMILY", commit_timestamp=None, partition_key="", low_watermark=None)
+              mutation_type="DELETE_FAMILY", commit_timestamp=None, partition_start_key=b"",
+        partition_end_key=b"", low_watermark=None)
     timer = MagicMock()
     out = list(processor.handleInputRows(b"r1", iter([row]), timer))
 
@@ -192,7 +196,8 @@ def test_handle_input_rows_delete_row_clears_state():
     processor._cells = mock_cells
 
     row = Row(row_key=b"r1", column_family="cf1", column_qualifier=b"q1", value=b"",
-              mutation_type="DELETE_ROW", commit_timestamp=None, partition_key="", low_watermark=None)
+              mutation_type="DELETE_ROW", commit_timestamp=None, partition_start_key=b"",
+        partition_end_key=b"", low_watermark=None)
     timer = MagicMock()
     out = list(processor.handleInputRows(b"r1", iter([row]), timer))
 
@@ -212,7 +217,8 @@ def test_handle_input_rows_unknown_mutation_type_ignored():
     processor._cells = mock_cells
 
     row = Row(row_key=b"r1", column_family="cf1", column_qualifier=b"q1", value=b"",
-              mutation_type="UNKNOWN", commit_timestamp=None, partition_key="", low_watermark=None)
+              mutation_type="UNKNOWN", commit_timestamp=None, partition_start_key=b"",
+        partition_end_key=b"", low_watermark=None)
     timer = MagicMock()
     out = list(processor.handleInputRows(b"r1", iter([row]), timer))
 
@@ -231,7 +237,8 @@ def test_handle_input_rows_column_family_bytes_decoded():
     processor._cells = mock_cells
 
     row = Row(row_key=b"r1", column_family=b"cf1", column_qualifier=b"q1", value=b"v1",
-              mutation_type="SET_CELL", commit_timestamp=None, partition_key="", low_watermark=None)
+              mutation_type="SET_CELL", commit_timestamp=None, partition_start_key=b"",
+        partition_end_key=b"", low_watermark=None)
     timer = MagicMock()
     out = list(processor.handleInputRows(b"r1", iter([row]), timer))
 
@@ -244,6 +251,73 @@ def test_processor_close_noop():
 
     processor = BigtableReconstructProcessor()
     processor.close()
+
+
+def test_handle_initial_state_populates_cells():
+    """handleInitialState with one row populates MapState from record."""
+    from bigtable_stateful_processor.processor import BigtableReconstructProcessor
+
+    processor = BigtableReconstructProcessor()
+    mock_cells = _make_mock_map_state()
+    processor._handle = MagicMock()
+    processor._cells = mock_cells
+
+    row = Row(row_key=b"r1", record={"cf1": b"v1", "cf2": b"v2"})
+    timer = MagicMock()
+    processor.handleInitialState(b"r1", iter([row]), timer)
+
+    assert mock_cells._state == {("cf1",): (b"v1",), ("cf2",): (b"v2",)}
+
+
+def test_handle_initial_state_empty_record():
+    """handleInitialState with empty record does not add entries."""
+    from bigtable_stateful_processor.processor import BigtableReconstructProcessor
+
+    processor = BigtableReconstructProcessor()
+    mock_cells = _make_mock_map_state()
+    processor._handle = MagicMock()
+    processor._cells = mock_cells
+
+    row = Row(row_key=b"r1", record={})
+    timer = MagicMock()
+    processor.handleInitialState(b"r1", iter([row]), timer)
+
+    assert mock_cells._state == {}
+
+
+def test_handle_initial_state_multiple_rows_last_wins():
+    """handleInitialState with multiple rows for same key: last row wins per key."""
+    from bigtable_stateful_processor.processor import BigtableReconstructProcessor
+
+    processor = BigtableReconstructProcessor()
+    mock_cells = _make_mock_map_state()
+    processor._handle = MagicMock()
+    processor._cells = mock_cells
+
+    rows = [
+        Row(row_key=b"r1", record={"cf1": b"first"}),
+        Row(row_key=b"r1", record={"cf1": b"second", "cf2": b"v2"}),
+    ]
+    timer = MagicMock()
+    processor.handleInitialState(b"r1", iter(rows), timer)
+
+    assert mock_cells._state == {("cf1",): (b"second",), ("cf2",): (b"v2",)}
+
+
+def test_handle_initial_state_skips_row_without_record():
+    """handleInitialState skips rows that have no record attribute."""
+    from bigtable_stateful_processor.processor import BigtableReconstructProcessor
+
+    processor = BigtableReconstructProcessor()
+    mock_cells = _make_mock_map_state()
+    processor._handle = MagicMock()
+    processor._cells = mock_cells
+
+    row = Row(row_key=b"r1")  # no record
+    timer = MagicMock()
+    processor.handleInitialState(b"r1", iter([row]), timer)
+
+    assert mock_cells._state == {}
 
 
 def _make_mock_map_state():

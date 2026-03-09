@@ -28,7 +28,8 @@ def test_schema_has_expected_fields():
         "value",
         "mutation_type",
         "commit_timestamp",
-        "partition_key",
+        "partition_start_key",
+        "partition_end_key",
         "low_watermark",
     ]
 
@@ -45,12 +46,13 @@ def test_schema_field_types():
     assert type_map["value"] == BinaryType()
     assert type_map["mutation_type"] == StringType()
     assert type_map["commit_timestamp"] == TimestampType()
-    assert type_map["partition_key"] == StringType()
+    assert type_map["partition_start_key"] == BinaryType()
+    assert type_map["partition_end_key"] == BinaryType()
     assert type_map["low_watermark"] == TimestampType()
 
 
 def test_schema_field_count():
-    """Test schema has exactly 8 fields."""
+    """Test schema has exactly 9 fields."""
     from bigtable_data_source.schema import CHANGE_STREAM_SCHEMA
 
-    assert len(CHANGE_STREAM_SCHEMA.fields) == 8
+    assert len(CHANGE_STREAM_SCHEMA.fields) == 9

@@ -28,6 +28,20 @@ Example usage with the bigtable_changes stream::
         )
     )
     reconstructed.writeStream.outputMode("update").format("console").start()
+
+With initial state from a Delta table (e.g. a previous run's output); pass GroupedData::
+
+    initial_state = spark.read.table("catalog.schema.bt_reconstructed").groupBy("row_key")
+    reconstructed = (
+        changes.groupBy("row_key")
+        .transformWithState(
+            statefulProcessor=BigtableReconstructProcessor(),
+            outputStructType=RECONSTRUCTED_RECORD_SCHEMA,
+            outputMode="Update",
+            timeMode="None",
+            initialState=initial_state,
+        )
+    )
 """
 
 from typing import Any, Iterator, Optional
@@ -61,6 +75,29 @@ class BigtableReconstructProcessor(StatefulProcessor):
             userKeySchema=_MAP_KEY_SCHEMA,
             valueSchema=_MAP_VALUE_SCHEMA,
         )
+
+    def handleInitialState(
+        self,
+        key: Any,
+        rows: Iterator[Row],
+        timerValues: TimerValues,
+    ) -> None:
+        """
+        Load state from an initial state batch (e.g. a Delta table with row_key + record).
+        Each row must have a 'record' column: a map of column_family (str) -> value (bytes).
+        If multiple rows exist for the same key, they are applied in order (last wins per key).
+        """
+        for row in rows:
+            record = getattr(row, "record", None)
+            if record is None:
+                continue
+            if not isinstance(record, dict):
+                record = dict(record) if record else {}
+            for cf, val in record.items():
+                if not isinstance(cf, str):
+                    cf = cf.decode("utf-8") if cf else ""
+                value = val if val is not None else b""
+                self._cells.updateValue((cf,), (value,))
 
     def handleInputRows(
         self,
