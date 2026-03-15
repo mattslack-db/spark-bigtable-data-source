@@ -17,7 +17,7 @@ pytest-spark = "^0.8.0"
 google-cloud-bigtable = "^2.28.0"
 
 [tool.poetry.group.dev.dependencies]
-ruff = "^0.14.9"
+ruff = "^0.15.6"
 pyspark = {extras = ["sql,connect"], version = "4.1.1"}
 grpcio = ">=1.76.0"
 grpcio-status = ">=1.76.0"
