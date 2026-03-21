@@ -19,9 +19,9 @@ google-cloud-bigtable = "^2.28.0"
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.14.9"
 pyspark = {extras = ["sql,connect"], version = "4.1.1"}
-grpcio = ">=1.76.0"
-grpcio-status = ">=1.76.0"
-googleapis-common-protos = ">=1.71.0"
+grpcio = "^1.76.0"
+grpcio-status = "^1.76.0"
+googleapis-common-protos = "^1.71.0"
 mypy = "^1.19.0"
 pyarrow = "^22.0.0"
 python-dotenv = "^1.0.0"

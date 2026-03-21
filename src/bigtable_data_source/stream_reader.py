@@ -1,21 +1,38 @@
 """Bigtable Change Stream reader implementation."""
 
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Mapping, Optional, Tuple, Union
 
+from google.api_core import exceptions as google_api_exceptions
 from pyspark.sql.datasource import DataSourceStreamReader
 
+from .mutation_types import MutationType
 from .partitioning import BigtablePartition
 
+_LOG = logging.getLogger(__name__)
 
-def _to_datetime_utc(ts):
+
+def _parse_positive_int(option_name: str, value: str | int) -> int:
+    """Parse a positive integer option; raise ValueError if invalid."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{option_name} must be an integer") from e
+    if n <= 0:
+        raise ValueError(f"{option_name} must be a positive integer")
+    return n
+
+
+def _to_datetime_utc(ts: Any) -> Optional[datetime]:
     """Convert protobuf Timestamp or datetime-like to timezone-aware datetime."""
     if ts is None:
         return None
     if hasattr(ts, "ToDatetime"):
         return ts.ToDatetime(tzinfo=timezone.utc)
     if hasattr(ts, "timestamp"):
-        from datetime import datetime
         return datetime.fromtimestamp(ts.timestamp(), tz=timezone.utc)
     # Already datetime-like (e.g. DatetimeWithNanoseconds from proto-plus)
     if hasattr(ts, "tzinfo") and ts.tzinfo is None:
@@ -41,9 +58,18 @@ class BigtableStreamReader:
       start_timestamp: When no continuation token is set, start the change stream
         from this time instead of "now". ISO 8601 string (e.g. "2025-03-01T00:00:00Z")
         or Unix timestamp (seconds). Ignored when resuming with a token.
+      read_stream_timeout_seconds: Max wall-clock seconds per partition per
+        read_change_stream call (default max(120, batch_duration_seconds * 12)).
+        Prevents a stalled gRPC stream from hanging the micro-batch indefinitely.
+      heartbeat_duration_seconds: Interval in seconds between server heartbeats
+        on the change stream gRPC (default 5). Lower values make empty batches
+        complete faster at the cost of more heartbeat messages.
+      empty_heartbeat_limit: Number of consecutive heartbeats with no data
+        before ending the micro-batch (default 3). Lower values reduce latency
+        for empty batches but may cause the reader to return before data arrives.
     """
 
-    def __init__(self, options):
+    def __init__(self, options: Mapping[str, Any]) -> None:
         self._validate_options(options)
         # Fail fast with a clear error if the Bigtable library is missing. Otherwise the
         # import happens lazily in _get_client() when initialOffset()/latestOffset() run
@@ -60,15 +86,41 @@ class BigtableStreamReader:
         self.instance_id = options["instance_id"]
         self.table_id = options["table_id"]
         self.app_profile = options.get("app_profile_id", "default")
-        self.batch_seconds = int(options.get("batch_duration_seconds", "10"))
-        self.max_rows_per_partition = int(options.get("max_rows_per_partition", "5000"))
+        self.batch_seconds = _parse_positive_int(
+            "batch_duration_seconds",
+            options.get("batch_duration_seconds", "10"),
+        )
+        self.max_rows_per_partition = _parse_positive_int(
+            "max_rows_per_partition",
+            options.get("max_rows_per_partition", "5000"),
+        )
+        _default_stream_timeout = str(max(120, self.batch_seconds * 12))
+        self.read_stream_timeout_seconds = _parse_positive_int(
+            "read_stream_timeout_seconds",
+            options.get("read_stream_timeout_seconds", _default_stream_timeout),
+        )
+        self.heartbeat_duration_seconds = _parse_positive_int(
+            "heartbeat_duration_seconds",
+            options.get("heartbeat_duration_seconds", "5"),
+        )
+        self.empty_heartbeat_limit = _parse_positive_int(
+            "empty_heartbeat_limit",
+            options.get("empty_heartbeat_limit", "3"),
+        )
         # Optional: JSON string of service account key dict; if set, use it instead of ADC
         self._credentials_json = options.get("credentials_json")
+        if self._credentials_json:
+            _LOG.warning(
+                "The credentials_json Spark option embeds private key material in the job "
+                "configuration; it may appear in Spark UI, logs, and event streams. For "
+                "production, prefer Application Default Credentials (ADC) or Workload "
+                "Identity Federation instead."
+            )
         # Optional: when no continuation token, start from this time (ISO 8601 str or Unix seconds)
         self._start_timestamp: Optional[datetime] = self._parse_start_timestamp(
             options.get("start_timestamp")
         )
-        self.options = options
+        self.options = dict(options)
 
         # partition_index → list of row dicts
         self._buffered_rows: dict[int, list] = {}
@@ -81,8 +133,9 @@ class BigtableStreamReader:
 
         self._client = None
         self._table = None
+        self._initial_offset_completed = False
 
-    def _validate_options(self, options):
+    def _validate_options(self, options: Mapping[str, Any]) -> None:
         required = ["project_id", "instance_id", "table_id"]
         missing = [opt for opt in required if opt not in options]
         if missing:
@@ -106,7 +159,7 @@ class BigtableStreamReader:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
 
-    def _get_client(self):
+    def _get_client(self) -> Tuple[Any, Any]:
         """Lazily create the Bigtable client and table reference."""
         if self._client is None:
             import json
@@ -123,12 +176,18 @@ class BigtableStreamReader:
                 try:
                     from google.oauth2 import service_account
                     sa_info = json.loads(self._credentials_json)
+                    _bt_scopes = (
+                        "https://www.googleapis.com/auth/bigtable.data",
+                        "https://www.googleapis.com/auth/bigtable.admin",
+                    )
                     credentials = service_account.Credentials.from_service_account_info(
                         sa_info,
-                        scopes=["https://www.googleapis.com/auth/bigtable.data", "https://www.googleapis.com/auth/bigtable.admin"],
+                        scopes=list(_bt_scopes),
                     )
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, ValueError, KeyError) as e:
+                    raise ValueError(
+                        f"credentials_json option is invalid or malformed: {e}"
+                    ) from e
             if credentials is not None:
                 self._client = bigtable.Client(
                     project=self.project_id, admin=True, credentials=credentials
@@ -145,21 +204,41 @@ class BigtableStreamReader:
         SampleRowKeys and return initial offset with no tokens.
         """
         partitions = self._fetch_partition_metadata()
+        self._initial_offset_completed = True
         return {str(p.partition_index): None for p in partitions}
 
     def latestOffset(self) -> dict:
         """
         Called each micro-batch trigger. Reads up to max_rows_per_partition
         changes from each partition and buffers them. Returns new token offsets.
+        If Spark has not called initialOffset() yet (e.g. new reader instance),
+        we discover partitions here so the stream can proceed.
         """
+        if not self._initial_offset_completed:
+            _ = self._fetch_partition_metadata()
+            self._initial_offset_completed = True
+        # Ensure client is created on this thread before parallel partition reads.
+        self._get_client()
         self._buffered_rows = {}
         new_offsets = {}
 
-        for idx, partition in self._partitions.items():
-            rows, new_token = self._read_partition_chunk(partition)
-            self._buffered_rows[idx] = rows
-            new_offsets[str(idx)] = new_token
-            self._tokens[idx] = new_token
+        # Read partitions in parallel to avoid 200+ sequential network round-trips per batch.
+        max_workers = min(32, max(1, len(self._partitions)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self._read_partition_chunk, partition): idx
+                for idx, partition in self._partitions.items()
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    rows, new_token = future.result()
+                except Exception as e:
+                    _LOG.exception("Partition %s read failed", idx)
+                    raise
+                self._buffered_rows[idx] = rows
+                new_offsets[str(idx)] = new_token
+                self._tokens[idx] = new_token
 
         return new_offsets
 
@@ -183,12 +262,18 @@ class BigtableStreamReader:
             )
         return result
 
-    def read(self, partition: BigtablePartition) -> Iterator[tuple]:
+    def read(
+        self, partition: BigtablePartition
+    ) -> Union[Iterator[tuple], Iterator[Any]]:
         """
         Called on Spark executors. Yields rows from this partition.
         Rows are carried on the partition object so they are available on the executor.
         """
-        rows = partition.rows if hasattr(partition, "rows") else self._buffered_rows.get(partition.partition_index, [])
+        rows = (
+            partition.rows
+            if hasattr(partition, "rows")
+            else self._buffered_rows.get(partition.partition_index, [])
+        )
         for row in rows:
             yield (
                 row["row_key"],
@@ -210,7 +295,7 @@ class BigtableStreamReader:
         if self._client is not None:
             self._client.close()
 
-    # ── Internal helpers ──────────────────────────────────────────────────
+    # -- Internal helpers --
 
     def _fetch_partition_metadata(self) -> List[BigtablePartition]:
         """
@@ -267,13 +352,18 @@ class BigtableStreamReader:
             # Fallback if partition came from elsewhere (e.g. tests)
             END_OF_TABLE = b"\xff" * 32
             end_key_open = partition.end_key if partition.end_key else END_OF_TABLE
-            raw_partition = {"row_range": {"start_key_closed": partition.start_key, "end_key_open": end_key_open}}
+            raw_partition = {
+                "row_range": {
+                    "start_key_closed": partition.start_key,
+                    "end_key_open": end_key_open,
+                },
+            }
 
         request = {
             "table_name": table.name,
             "app_profile_id": self.app_profile,
             "partition": raw_partition,
-            "heartbeat_duration": {"seconds": 5},
+            "heartbeat_duration": {"seconds": self.heartbeat_duration_seconds},
         }
 
         if new_token:
@@ -305,15 +395,24 @@ class BigtableStreamReader:
 
             count = 0
             heartbeats_without_data = 0
+            deadline = time.monotonic() + float(self.read_stream_timeout_seconds)
             for response in stream:
+                if time.monotonic() > deadline:
+                    _LOG.warning(
+                        "read_change_stream exceeded read_stream_timeout_seconds=%s "
+                        "for partition %s; breaking to avoid hanging the micro-batch",
+                        self.read_stream_timeout_seconds,
+                        partition.partition_index,
+                    )
+                    break
                 # Proto-plus: check which oneof is set by truthiness (no HasField)
                 if response.heartbeat:
                     hb = response.heartbeat
                     low_watermark = _to_datetime_utc(hb.estimated_low_watermark)
                     new_token = hb.continuation_token.token if hb.continuation_token else None
                     heartbeats_without_data += 1
-                    # End micro-batch at heartbeat if we have rows, or after 3 heartbeats with no data
-                    if count >= 1 or heartbeats_without_data >= 3:
+                    # End micro-batch at heartbeat if we have rows, or after N heartbeats with no data
+                    if count >= 1 or heartbeats_without_data >= self.empty_heartbeat_limit:
                         break
 
                 elif response.close_stream:
@@ -324,7 +423,11 @@ class BigtableStreamReader:
                     dc = response.data_change
                     commit_ts = _to_datetime_utc(dc.commit_timestamp)
                     new_token = dc.token
-                    low_wm = _to_datetime_utc(dc.estimated_low_watermark) if dc.estimated_low_watermark else low_watermark
+                    low_wm = (
+                        _to_datetime_utc(dc.estimated_low_watermark)
+                        if dc.estimated_low_watermark
+                        else low_watermark
+                    )
                     row_key = bytes(dc.row_key) if dc.row_key else b""
 
                     for chunk in dc.chunks:
@@ -339,11 +442,30 @@ class BigtableStreamReader:
                     if count >= self.max_rows_per_partition:
                         break
 
-        except Exception as e:
-            print(
-                f"[BigtableChangeStream] Error on partition "
-                f"{partition.partition_index}: {e}"
+        except google_api_exceptions.Unauthenticated:
+            _LOG.exception(
+                "Bigtable authentication failed on partition %s",
+                partition.partition_index,
             )
+            raise
+        except google_api_exceptions.PermissionDenied:
+            _LOG.exception(
+                "Bigtable permission denied on partition %s",
+                partition.partition_index,
+            )
+            raise
+        except google_api_exceptions.GoogleAPICallError:
+            _LOG.exception(
+                "Bigtable API error on partition %s",
+                partition.partition_index,
+            )
+            raise
+        except Exception:
+            _LOG.exception(
+                "Unexpected error reading change stream on partition %s",
+                partition.partition_index,
+            )
+            raise
 
         return rows, new_token
 
@@ -357,21 +479,21 @@ class BigtableStreamReader:
         mutation_type = None
 
         if mutation.set_cell:
-            mutation_type = "SET_CELL"
+            mutation_type = MutationType.SET_CELL.value
             sc = mutation.set_cell
             cf = sc.family_name or ""
             cq = sc.column_qualifier or b""
             value = sc.value or b""
         elif mutation.delete_from_column:
-            mutation_type = "DELETE_COLUMN"
+            mutation_type = MutationType.DELETE_COLUMN.value
             d = mutation.delete_from_column
             cf = d.family_name or ""
             cq = d.column_qualifier or b""
         elif mutation.delete_from_family:
-            mutation_type = "DELETE_FAMILY"
+            mutation_type = MutationType.DELETE_FAMILY.value
             cf = mutation.delete_from_family.family_name or ""
         elif mutation.delete_from_row:
-            mutation_type = "DELETE_ROW"
+            mutation_type = MutationType.DELETE_ROW.value
         else:
             return None
 

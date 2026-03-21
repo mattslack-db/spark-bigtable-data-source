@@ -1,6 +1,7 @@
 """Pytest configuration and shared fixtures."""
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -38,8 +39,17 @@ def spark():
     spark = SparkSession.builder \
         .appName("bigtable-tests") \
         .master("local[2]") \
+        .config("spark.sql.shuffle.partitions", "4") \
         .getOrCreate()
     yield spark
+    # Stop all streaming queries so they shut down cleanly before the session stops.
+    # Avoids daemon thread cleanup races and "NoneType does not support context manager" at exit.
+    for q in spark.streams.active:
+        try:
+            q.stop()
+        except Exception:
+            pass
+    time.sleep(1)
     spark.stop()
 
 

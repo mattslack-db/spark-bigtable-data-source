@@ -1,0 +1,83 @@
+bundle:
+  name: spark-bigtable-data-source
+
+variables:
+  project_id:
+    default: gcp-sandbox-field-eng
+  instance_id:
+    default: matt-slack-eval
+  table_id:
+    default: changes
+  delta_table:
+    default: default.bt_stream_output
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://8259561344410530.0.gcp.databricks.com
+      profile: gcp-sandbox
+
+artifacts:
+  bigtable_wheel:
+    type: whl
+    build: poetry build -f wheel
+    path: .
+
+resources:
+  jobs:
+    bigtable_demo:
+      name: bigtable-stream-demo
+      tasks:
+        - task_key: populate_table
+          notebook_task:
+            notebook_path: notebooks/populate-table.ipynb
+            base_parameters:
+              project_id: ${var.project_id}
+              instance_id: ${var.instance_id}
+              table_id: ${var.table_id}
+              credentials_file: ""
+              run_duration_seconds: "300"
+          libraries:
+            - whl: dist/*.whl
+            - pypi:
+                package: google-cloud-bigtable
+          new_cluster:
+            spark_version: 17.3.x-scala2.13
+            node_type_id: n2-standard-4
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            gcp_attributes:
+              zone_id: us-central1-a
+            custom_tags:
+              ResourceClass: SingleNode
+
+        - task_key: stream_demo
+          notebook_task:
+            notebook_path: notebooks/stream-demo.ipynb
+            base_parameters:
+              project_id: ${var.project_id}
+              instance_id: ${var.instance_id}
+              table_id: ${var.table_id}
+              credentials_file: ""
+              delta_table: ${var.delta_table}
+              checkpoint_location: dbfs:/tmp/bt_stream_ckpt_bundle
+              run_duration_seconds: "120"
+          libraries:
+            - whl: dist/*.whl
+            - pypi:
+                package: google-cloud-bigtable
+          new_cluster:
+            spark_version: 17.3.x-scala2.13
+            node_type_id: n2-standard-4
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            gcp_attributes:
+              zone_id: us-central1-a
+            custom_tags:
+              ResourceClass: SingleNode

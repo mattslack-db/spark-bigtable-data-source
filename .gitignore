@@ -1,6 +1,67 @@
-dist/
-.pytest_cache/
-.vscode/
+# --- Python ---
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+
+# --- Test / coverage (pytest, CI) ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+cov.xml
+htmlcov/
+pytest-coverage.txt
+test-unit.xml
+
+# --- Type check / lint ---
+.mypy_cache/
+.ruff_cache/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Spark local (pytest-spark / local[*]) ---
+derby.log
+metastore_db/
+spark-warehouse/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+
+# --- Secrets & local config ---
 .env
+.env.*
+!.env.example
+# GCP / service account JSON (multiple patterns; prefer keys under a local-only path)
 gcp*.json
+credentials.json
+service-account*.json
+*-sa.json
+
+# --- Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+# .terraform.lock.hcl is committed for reproducible provider versions
+
+# --- Databricks bundle (state, workspace paths) ---
+.databricks/

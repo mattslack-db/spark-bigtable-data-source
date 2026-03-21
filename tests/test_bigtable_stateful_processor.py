@@ -1,6 +1,5 @@
 """Unit tests for Bigtable stateful processor (transformWithState)."""
 
-import pytest
 from unittest.mock import MagicMock
 from pyspark.sql import Row
 

@@ -1,5 +1,7 @@
 """Bigtable Change Stream Data Source implementation."""
 
+from typing import Any, Dict
+
 from pyspark.sql.datasource import DataSource
 from pyspark.sql.types import StructType
 
@@ -11,10 +13,10 @@ class BigtableChangeStreamDataSource(DataSource):
     """PySpark Data Source for Google Cloud Bigtable Change Streams."""
 
     @classmethod
-    def name(cls):
+    def name(cls) -> str:
         return "bigtable_changes"
 
-    def __init__(self, options):
+    def __init__(self, options: Dict[str, Any]) -> None:
         self.options = options
 
     def schema(self) -> StructType:

@@ -44,7 +44,7 @@ With initial state from a Delta table (e.g. a previous run's output); pass Group
     )
 """
 
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator
 
 from pyspark.sql import Row
 from pyspark.sql.streaming.stateful_processor import (
@@ -53,6 +53,8 @@ from pyspark.sql.streaming.stateful_processor import (
     TimerValues,
 )
 from pyspark.sql.types import BinaryType, StringType, StructType
+
+from bigtable_data_source.mutation_types import MutationType
 
 # MapState: key = column_family (single string), value = latest value (bytes)
 _MAP_KEY_SCHEMA = StructType().add("column_family", StringType())
@@ -87,17 +89,18 @@ class BigtableReconstructProcessor(StatefulProcessor):
         Each row must have a 'record' column: a map of column_family (str) -> value (bytes).
         If multiple rows exist for the same key, they are applied in order (last wins per key).
         """
+        row_key = _extract_row_key(key)
+        count = 0
         for row in rows:
-            record = getattr(row, "record", None)
+            record = _extract_record(row)
             if record is None:
                 continue
-            if not isinstance(record, dict):
-                record = dict(record) if record else {}
             for cf, val in record.items():
                 if not isinstance(cf, str):
                     cf = cf.decode("utf-8") if cf else ""
                 value = val if val is not None else b""
                 self._cells.updateValue((cf,), (value,))
+                count += 1
 
     def handleInputRows(
         self,
@@ -106,18 +109,19 @@ class BigtableReconstructProcessor(StatefulProcessor):
         timerValues: TimerValues,
     ) -> Iterator[Row]:
         row_key = _extract_row_key(key)
+        pre_state = _build_record_from_state(self._cells)
         for row in rows:
             cf = row.column_family
             if not isinstance(cf, str):
                 cf = cf.decode("utf-8") if cf else ""
             map_key = (cf,)
             mutation_type = (row.mutation_type or "").strip().upper()
-            if mutation_type == "SET_CELL":
+            if mutation_type == MutationType.SET_CELL.value:
                 value = row.value if row.value is not None else b""
                 self._cells.updateValue(map_key, (value,))
-            elif mutation_type == "DELETE_ROW":
+            elif mutation_type == MutationType.DELETE_ROW.value:
                 self._cells.clear()
-            elif mutation_type in ("DELETE_COLUMN", "DELETE_FAMILY"):
+            elif mutation_type in (MutationType.DELETE_COLUMN.value, MutationType.DELETE_FAMILY.value):
                 if self._cells.containsKey(map_key):
                     self._cells.removeKey(map_key)
             # else: ignore unknown mutation type
@@ -127,6 +131,27 @@ class BigtableReconstructProcessor(StatefulProcessor):
 
     def close(self) -> None:
         pass
+
+
+def _extract_record(row: Any) -> dict | None:
+    """Extract a record dict from an initial state row.
+
+    PySpark's transformWithState passes initial state rows as either:
+      - Row objects with a 'record' attribute (unit tests, some PySpark versions)
+      - Raw column values: the record column arrives as a list of (key, value)
+        tuples or a dict (PySpark 4.x streaming workers)
+    """
+    # Row object with named field
+    record = getattr(row, "record", None)
+    if record is not None:
+        return dict(record) if not isinstance(record, dict) else record
+    # Already a dict (e.g. MapType deserialized directly)
+    if isinstance(row, dict):
+        return row
+    # List of (key, value) tuples — PySpark MapType deserialization
+    if isinstance(row, list) and row and isinstance(row[0], (tuple, list)):
+        return dict(row)
+    return None
 
 
 def _extract_row_key(key: Any) -> bytes:

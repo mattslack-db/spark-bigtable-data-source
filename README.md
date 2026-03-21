@@ -161,6 +161,7 @@ See `stream-demo.ipynb` and `examples.ipynb` for full examples.
 |--------|----------|---------|-------------|
 | `batch_duration_seconds` | No | `10` | Target duration per micro-batch |
 | `max_rows_per_partition` | No | `5000` | Max mutations to read per partition per batch |
+| `read_stream_timeout_seconds` | No | `max(120, 12 * batch_duration_seconds)` | Wall-clock cap per partition per gRPC read; avoids hanging on a stalled stream |
 | `start_timestamp` | No | (now) | When no checkpoint exists, start from this time: ISO 8601 (e.g. `2025-03-01T00:00:00Z`) or Unix seconds. Ignored when resuming with a checkpoint. |
 
 ## Schema
@@ -242,6 +243,10 @@ poetry run ruff check src/
 poetry run ruff format src/
 poetry run mypy src/
 ```
+
+### Databricks bundle
+
+The `.databricks/` directory (bundle deploy output, Terraform state, workspace metadata) is **gitignored**. Do not commit it. Regenerate locally with `databricks bundle deploy` after cloning.
 
 ## How It Works
 

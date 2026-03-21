@@ -1,5 +1,7 @@
 """Tests for Bigtable Change Stream reader logic."""
 
+import logging
+
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -71,6 +73,26 @@ def test_stream_reader_custom_options():
     assert reader.max_rows_per_partition == 1000
 
 
+def test_batch_duration_seconds_invalid_raises_value_error(basic_options):
+    """batch_duration_seconds must be a positive integer."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    for invalid in ("x", "0", "-1", "1.5", ""):
+        options = {**basic_options, "batch_duration_seconds": invalid}
+        with pytest.raises(ValueError, match="batch_duration_seconds"):
+            BigtableStreamReader(options)
+
+
+def test_max_rows_per_partition_invalid_raises_value_error(basic_options):
+    """max_rows_per_partition must be a positive integer."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    for invalid in ("x", "0", "-1", "1.5", ""):
+        options = {**basic_options, "max_rows_per_partition": invalid}
+        with pytest.raises(ValueError, match="max_rows_per_partition"):
+            BigtableStreamReader(options)
+
+
 def test_stream_reader_does_not_connect_on_init(basic_options):
     """Test that __init__ does NOT create a Bigtable client."""
     from bigtable_data_source.stream_reader import BigtableStreamReader
@@ -79,6 +101,52 @@ def test_stream_reader_does_not_connect_on_init(basic_options):
 
     assert reader._client is None
     assert reader._table is None
+
+
+def test_credentials_json_logs_security_warning(basic_options, caplog):
+    """credentials_json triggers a warning about private key exposure in job config."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    caplog.set_level(logging.WARNING, logger="bigtable_data_source.stream_reader")
+    BigtableStreamReader({**basic_options, "credentials_json": "{}"})
+    assert any("credentials_json" in r.message for r in caplog.records)
+    assert any(
+        "Application Default Credentials" in r.message or "ADC" in r.message
+        for r in caplog.records
+    )
+
+
+def test_credentials_json_invalid_raises_value_error():
+    """Malformed credentials_json must raise, not silently fall back to ADC."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(
+        {
+            "project_id": "p",
+            "instance_id": "i",
+            "table_id": "t",
+            "credentials_json": "not valid json",
+        }
+    )
+    with pytest.raises(ValueError, match="credentials_json option is invalid"):
+        reader._get_client()
+
+
+def test_credentials_json_not_sa_dict_raises_value_error():
+    """Valid JSON but missing service account fields must raise."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    import json
+
+    reader = BigtableStreamReader(
+        {
+            "project_id": "p",
+            "instance_id": "i",
+            "table_id": "t",
+            "credentials_json": json.dumps({"foo": "bar"}),
+        }
+    )
+    with pytest.raises(ValueError, match="credentials_json option is invalid"):
+        reader._get_client()
 
 
 def _make_partitions(n):
@@ -363,8 +431,9 @@ def test_stream_reader_init_stores_start_timestamp(basic_options):
     """Reader stores _start_timestamp when start_timestamp option is set."""
     from bigtable_data_source.stream_reader import BigtableStreamReader
 
-    basic_options["start_timestamp"] = "2025-03-01T00:00:00Z"
-    reader = BigtableStreamReader(basic_options)
+    reader = BigtableStreamReader(
+        {**basic_options, "start_timestamp": "2025-03-01T00:00:00Z"}
+    )
     assert reader._start_timestamp is not None
     assert reader._start_timestamp.year == 2025 and reader._start_timestamp.month == 3
 
@@ -502,3 +571,223 @@ def test_read_partition_chunk_uses_continuation_token_when_provided(basic_option
     assert tokens_cfg["tokens"][0]["token"] == "saved-continuation-token"
     assert "start_time" not in captured_request
     assert new_token == "next-token"
+
+
+# --- _to_datetime_utc, latestOffset, _fetch_partition_metadata ---
+
+
+def test_to_datetime_utc_none():
+    from bigtable_data_source.stream_reader import _to_datetime_utc
+
+    assert _to_datetime_utc(None) is None
+
+
+def test_to_datetime_utc_aware_datetime_via_timestamp():
+    from bigtable_data_source.stream_reader import _to_datetime_utc
+
+    dt = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    out = _to_datetime_utc(dt)
+    assert out.tzinfo == timezone.utc
+    assert abs((out - dt).total_seconds()) < 1e-6
+
+
+def test_to_datetime_utc_naive_datetime_gets_utc():
+    from bigtable_data_source.stream_reader import _to_datetime_utc
+
+    dt = datetime(2025, 1, 1, 12, 0, 0)
+    out = _to_datetime_utc(dt)
+    assert out.tzinfo == timezone.utc
+
+
+def test_to_datetime_utc_proto_to_datetime():
+    from bigtable_data_source.stream_reader import _to_datetime_utc
+
+    ts = MagicMock()
+    aware = datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+    ts.ToDatetime = MagicMock(return_value=aware)
+    assert _to_datetime_utc(ts) == aware
+
+
+def test_to_datetime_utc_object_with_timestamp_method():
+    from bigtable_data_source.stream_reader import _to_datetime_utc
+
+    class HasTimestamp:
+        def timestamp(self):
+            return 1704067200.0
+
+    out = _to_datetime_utc(HasTimestamp())
+    assert out.year == 2024
+    assert out.tzinfo == timezone.utc
+
+
+def test_latest_offset_self_initializes_when_initial_offset_not_called(basic_options):
+    """When latestOffset() is called first (e.g. Spark uses a new reader), it discovers partitions then runs."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    p = BigtablePartition(0, b"a", b"b", None)
+
+    def fake_fetch():
+        reader._partitions = {0: p}
+        reader._tokens = {0: None}
+        reader._raw_partitions = {0: MagicMock()}
+        return [p]
+
+    with patch.object(
+        reader,
+        "_fetch_partition_metadata",
+        side_effect=fake_fetch,
+    ) as mock_fetch:
+        with patch.object(
+            reader,
+            "_read_partition_chunk",
+            return_value=([], "token"),
+        ):
+            offsets = reader.latestOffset()
+    mock_fetch.assert_called_once()
+    assert reader._initial_offset_completed is True
+    assert offsets == {"0": "token"}
+
+
+def test_read_partition_chunk_wall_clock_timeout(basic_options):
+    """Stalled stream yields no further iterations once wall-clock budget is exceeded."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(
+        {**basic_options, "read_stream_timeout_seconds": "60"}
+    )
+    reader._tokens = {0: None}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+
+    def infinite_heartbeats():
+        while True:
+            hb = MagicMock()
+            hb.estimated_low_watermark = None
+            hb.continuation_token = MagicMock()
+            hb.continuation_token.token = "tok"
+            r = MagicMock()
+            r.heartbeat = hb
+            r.close_stream = None
+            r.data_change = None
+            yield r
+
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = (
+        lambda **kw: infinite_heartbeats()
+    )
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        with patch(
+            "bigtable_data_source.stream_reader.time.monotonic",
+            side_effect=[0.0, 0.0, 1e9],
+        ):
+            rows, new_token = reader._read_partition_chunk(partition)
+    assert rows == []
+    assert new_token == "tok"
+
+
+def test_read_partition_chunk_permission_denied_raises(basic_options):
+    from google.api_core.exceptions import PermissionDenied
+
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._tokens = {0: None}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = MagicMock(
+        side_effect=PermissionDenied("denied")
+    )
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        with pytest.raises(PermissionDenied):
+            reader._read_partition_chunk(partition)
+
+
+def test_read_partition_chunk_unauthenticated_raises(basic_options):
+    from google.api_core.exceptions import Unauthenticated
+
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._tokens = {0: None}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = MagicMock(
+        side_effect=Unauthenticated("invalid credentials")
+    )
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        with pytest.raises(Unauthenticated):
+            reader._read_partition_chunk(partition)
+
+
+def test_read_stream_timeout_seconds_invalid_raises(basic_options):
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    with pytest.raises(ValueError, match="read_stream_timeout_seconds"):
+        BigtableStreamReader({**basic_options, "read_stream_timeout_seconds": "0"})
+
+
+def test_latest_offset_buffers_rows_and_returns_tokens(basic_options):
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._initial_offset_completed = True
+    p = BigtablePartition(0, b"a", b"b", None)
+    reader._partitions = {0: p}
+    reader._tokens = {0: None}
+    reader._raw_partitions = {0: MagicMock()}
+    one_row = {
+        "row_key": b"rk",
+        "column_family": "cf",
+        "column_qualifier": b"cq",
+        "value": b"v",
+        "mutation_type": "SET_CELL",
+        "commit_timestamp": datetime.now(timezone.utc),
+        "partition_start_key": b"a",
+        "partition_end_key": b"b",
+        "low_watermark": None,
+    }
+    with patch.object(
+        reader,
+        "_read_partition_chunk",
+        return_value=([one_row], "continuation-xyz"),
+    ):
+        offsets = reader.latestOffset()
+    assert offsets == {"0": "continuation-xyz"}
+    assert reader._buffered_rows[0] == [one_row]
+    assert reader._tokens[0] == "continuation-xyz"
+
+
+def test_fetch_partition_metadata(basic_options):
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    rr = MagicMock()
+    rr.start_key_closed = b"\x00\x01"
+    rr.end_key_open = b"\x00\x02"
+    part = MagicMock()
+    part.row_range = rr
+    resp = MagicMock()
+    resp.partition = part
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    dc = MagicMock()
+    dc.generate_initial_change_stream_partitions = MagicMock(return_value=iter([resp]))
+    mock_table._instance._client.table_data_client = dc
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        partitions = reader._fetch_partition_metadata()
+    assert len(partitions) == 1
+    assert partitions[0].partition_index == 0
+    assert partitions[0].start_key == b"\x00\x01"
+    assert partitions[0].end_key == b"\x00\x02"
+    assert 0 in reader._partitions
