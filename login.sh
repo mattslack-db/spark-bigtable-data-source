@@ -8,3 +8,5 @@ cd "$SCRIPT_DIR"
 if [ -f .env ]; then set -a; source .env; set +a; fi
 
 databricks auth login --host "$DATABRICKS_HOST" --profile "$DATABRICKS_PROFILE"
+
+gcloud auth application-default set-quota-project "$GCP_PROJECT_ID"

@@ -16,7 +16,7 @@ databricks sync --profile "$DATABRICKS_PROFILE" \
   --exclude src --exclude tests --exclude "*.sh" --exclude ".gitignore" --exclude ".github" \
   --exclude "pyproject.toml" --exclude "pytest.ini" --exclude "pytest-coverage.txt" \
   --exclude "*.md" --exclude "poetry.lock" \
-  --include dist --include "*.ipynb" --include "gcp*.json" . \
+  --include dist --include "notebooks/*.ipynb" --include "gcp*.json" . \
   /Workspace/Users/matt.slack@databricks.com/spark-bigtable-data-source
 
 echo "Done"

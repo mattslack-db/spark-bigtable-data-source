@@ -142,7 +142,7 @@ reconstructed = (
 
 Use this to resume from a saved snapshot, migrate from another pipeline, or bootstrap state from a batch export.
 
-See `stream-demo.ipynb` and `examples.ipynb` for full examples.
+See `notebooks/stream-demo.ipynb` and `notebooks/examples.ipynb` for full examples.
 
 ## Configuration Options
 
@@ -182,9 +182,12 @@ All change stream events are exposed with this fixed schema:
 
 ## Testing with Synthetic Data
 
-A helper script deploys a Bigtable instance and table (with change streams enabled) in your GCP sandbox and writes repeated synthetic updates to a single row, so you can test the streaming source without manual setup.
+You can provision a Bigtable instance and table (with change stream) for demos in either of these ways:
 
-**Prerequisites:** `gcloud auth application-default login`, Bigtable Admin API enabled, and permissions to create instances and tables.
+- **Terraform (recommended):** From the repo root, run `./scripts/setup-bigtable-demo.sh` with `GCP_PROJECT_ID` set, or use the config in [`terraform/`](terraform/). See [terraform/README.md](terraform/README.md).
+- **Integration test helper:** The test suite can create instance and table on the fly when env vars are set (see below).
+
+**Prerequisites:** `gcloud auth application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`), Bigtable Admin API enabled, and permissions to create instances and tables.
 
 ```bash
 # Set your GCP sandbox project and Bigtable IDs
