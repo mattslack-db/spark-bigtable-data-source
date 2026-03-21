@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and set your project_id.
+# terraform.tfvars is gitignored; do not commit real project IDs.
+
+project_id = "your-gcp-project-id"
+
+# Optional overrides (defaults in variables.tf):
+# region          = "us-central1"
+# instance_id     = "bt-demo"
+# table_id        = "changes"
+# column_families = ["cf1", "cf2"]
