@@ -26,22 +26,34 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
   set +a
 fi
 
-# Pass through to Terraform; CLI/env take precedence over .env
-export TF_VAR_project_id="${TF_VAR_project_id:-${GCP_PROJECT_ID:-}}"
-export TF_VAR_region="${TF_VAR_region:-${BIGTABLE_REGION:-}}"
-export TF_VAR_instance_id="${TF_VAR_instance_id:-${BIGTABLE_INSTANCE_ID:-}}"
-export TF_VAR_table_id="${TF_VAR_table_id:-${BIGTABLE_TABLE_ID:-}}"
+# Pass through to Terraform; CLI/env take precedence over .env.
+# Only export non-empty values: Terraform treats a set-but-empty TF_VAR_ env var
+# as an explicit empty string, which would override (defeat) the defaults in
+# variables.tf. Leaving an optional var unset lets that default apply.
+export_if_set() {
+  local name="$1" value="$2"
+  [[ -n "$value" ]] && export "$name=$value"
+  return 0
+}
+
+export_if_set TF_VAR_project_id  "${TF_VAR_project_id:-${GCP_PROJECT_ID:-}}"
+export_if_set TF_VAR_region      "${TF_VAR_region:-${BIGTABLE_REGION:-}}"
+export_if_set TF_VAR_instance_id "${TF_VAR_instance_id:-${BIGTABLE_INSTANCE_ID:-}}"
+export_if_set TF_VAR_table_id    "${TF_VAR_table_id:-${BIGTABLE_TABLE_ID:-}}"
 
 COMMAND="${1:-apply}"
 
 require_project_id() {
-  if [[ -z "${TF_VAR_project_id:-}" ]]; then
-    if [[ -f "$TF_DIR/terraform.tfvars" ]]; then
-      return 0
-    fi
-    echo "Set GCP_PROJECT_ID or TF_VAR_project_id, or add to .env, or create terraform/terraform.tfvars with project_id"
-    exit 1
+  if [[ -n "${TF_VAR_project_id:-}" ]]; then
+    return 0
   fi
+  # Fall back to terraform.tfvars, but only if it actually declares project_id.
+  if [[ -f "$TF_DIR/terraform.tfvars" ]] \
+     && grep -Eq '^[[:space:]]*project_id[[:space:]]*=' "$TF_DIR/terraform.tfvars"; then
+    return 0
+  fi
+  echo "Set GCP_PROJECT_ID or TF_VAR_project_id, or add to .env, or create terraform/terraform.tfvars with project_id" >&2
+  exit 1
 }
 
 case "$COMMAND" in

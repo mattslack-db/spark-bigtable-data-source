@@ -25,6 +25,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'poetry'
       - name: Install dependencies
-        run: poetry install --no-interaction --frozen
+        run: poetry install --no-interaction
       - name: Run tests
         run: poetry run pytest --junitxml=test-unit.xml --cov=bigtable_data_source --cov-report=term-missing:skip-covered --cov-report xml:cov.xml -vv tests | tee pytest-coverage.txt

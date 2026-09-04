@@ -17,7 +17,8 @@ Skip in CI (no Bigtable):
 
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import pytest
 
@@ -42,6 +43,64 @@ def _wait_for_stream_rows(spark, query_name, min_rows=1, timeout_seconds=60, pol
             pass
         time.sleep(poll_interval)
     return None
+
+
+def _wait_for_row_keys(spark, query_name, row_keys, timeout_seconds=90, poll_interval=3):
+    """Wait until the in-memory table has >=1 event for every row_key, or timeout.
+
+    Change-stream delivery is async and per-partition across micro-batches, so a plain
+    row-count wait can return before events from a slower partition arrive. Returns the
+    rows collected so far on timeout so the caller's assertions produce a clear message.
+    """
+    wanted = {bytes(k) for k in row_keys}
+    deadline = time.time() + timeout_seconds
+    rows: list = []
+    while time.time() < deadline:
+        try:
+            rows = spark.table(query_name).collect()
+            if wanted <= {bytes(r.row_key) for r in rows}:
+                return rows
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    return rows
+
+
+@contextmanager
+def _running_memory_stream(
+    df,
+    query_name,
+    *,
+    output_mode="append",
+    trigger="5 seconds",
+    startup_sleep=5,
+    join_timeout=15,
+):
+    """Run `df` as a background memory-sink streaming query for the duration of the block.
+
+    Starts the query and an awaitTermination thread, sleeps `startup_sleep` so the source
+    can call initialOffset() and begin listening, yields the query, then stops it and joins
+    the thread on exit. Extracts the start/thread/sleep/stop/join boilerplate shared by the
+    integration tests.
+    """
+    query = (
+        df.writeStream.format("memory")
+        .queryName(query_name)
+        .outputMode(output_mode)
+        .trigger(processingTime=trigger)
+        .start()
+    )
+    thread = threading.Thread(target=query.awaitTermination, daemon=False)
+    thread.start()
+    time.sleep(startup_sleep)
+    try:
+        yield query
+    finally:
+        try:
+            query.stop()
+        except Exception:
+            pass
+        thread.join(timeout=join_timeout)
 
 
 @pytest.fixture(scope="module")
@@ -110,7 +169,6 @@ def test_bigtable_synthetic_data_and_stream_read(spark, bigtable_ready):
     }
 
     query_name = "bt_changes_integration"
-    trigger_interval = "5 seconds"
 
     # Start streaming query in background (reads change stream, writes to in-memory table)
     changes = (
@@ -119,43 +177,21 @@ def test_bigtable_synthetic_data_and_stream_read(spark, bigtable_ready):
         .load()
     )
 
-    query = (
-        changes.writeStream.format("memory")
-        .queryName(query_name)
-        .outputMode("append")
-        .trigger(processingTime=trigger_interval)
-        .start()
-    )
+    with _running_memory_stream(changes, query_name):
+        # Write synthetic data so change stream emits events
+        num_mutations = 5
+        write_synthetic_mutations(
+            project_id=project_id,
+            instance_id=instance_id,
+            table_id=table_id,
+            column_family=column_family,
+            count=num_mutations,
+            row_key=b"synth-row-1",
+            column=b"payload",
+        )
 
-    def run_stream():
-        query.awaitTermination()
-
-    stream_thread = threading.Thread(target=run_stream, daemon=False)
-    stream_thread.start()
-
-    # Give the stream time to call initialOffset and start listening
-    time.sleep(5)
-
-    # Write synthetic data so change stream emits events
-    num_mutations = 5
-    write_synthetic_mutations(
-        project_id=project_id,
-        instance_id=instance_id,
-        table_id=table_id,
-        column_family=column_family,
-        count=num_mutations,
-        row_key=b"synth-row-1",
-        column=b"payload",
-    )
-
-    # Wait for at least one micro-batch to complete and yield rows (avoids stopping mid-batch)
-    rows = _wait_for_stream_rows(spark, query_name, min_rows=1, timeout_seconds=60, poll_interval=2)
-
-    try:
-        query.stop()
-    except Exception:
-        pass
-    stream_thread.join(timeout=10)
+        # Wait for at least one micro-batch to complete and yield rows (avoids stopping mid-batch)
+        rows = _wait_for_stream_rows(spark, query_name, min_rows=1, timeout_seconds=60, poll_interval=2)
 
     # Use collected rows if we got them; otherwise read table again after stop
     if rows is None:
@@ -204,7 +240,6 @@ def test_stream_with_start_timestamp(spark, bigtable_ready):
     }
 
     query_name = "bt_changes_start_timestamp"
-    trigger_interval = "5 seconds"
 
     changes = (
         spark.readStream.format("bigtable_changes")
@@ -212,41 +247,20 @@ def test_stream_with_start_timestamp(spark, bigtable_ready):
         .load()
     )
 
-    query = (
-        changes.writeStream.format("memory")
-        .queryName(query_name)
-        .outputMode("append")
-        .trigger(processingTime=trigger_interval)
-        .start()
-    )
+    with _running_memory_stream(changes, query_name):
+        num_mutations = 5
+        write_synthetic_mutations(
+            project_id=project_id,
+            instance_id=instance_id,
+            table_id=table_id,
+            column_family=column_family,
+            count=num_mutations,
+            row_key=b"synth-row-start-ts",
+            column=b"payload",
+        )
 
-    def run_stream():
-        query.awaitTermination()
-
-    stream_thread = threading.Thread(target=run_stream, daemon=False)
-    stream_thread.start()
-
-    time.sleep(5)
-
-    num_mutations = 5
-    write_synthetic_mutations(
-        project_id=project_id,
-        instance_id=instance_id,
-        table_id=table_id,
-        column_family=column_family,
-        count=num_mutations,
-        row_key=b"synth-row-start-ts",
-        column=b"payload",
-    )
-
-    # Wait for at least one micro-batch to complete and yield rows (avoids stopping mid-batch)
-    rows = _wait_for_stream_rows(spark, query_name, min_rows=1, timeout_seconds=60, poll_interval=2)
-
-    try:
-        query.stop()
-    except Exception:
-        pass
-    stream_thread.join(timeout=10)
+        # Wait for at least one micro-batch to complete and yield rows (avoids stopping mid-batch)
+        rows = _wait_for_stream_rows(spark, query_name, min_rows=1, timeout_seconds=60, poll_interval=2)
 
     if rows is None:
         result = spark.table(query_name)
@@ -284,7 +298,6 @@ def test_stream_uses_continuation_token_across_batches(spark, bigtable_ready):
     }
 
     query_name = "bt_changes_continuation_token"
-    trigger_interval = "5 seconds"
     wait_after_writes = 25
 
     changes = (
@@ -292,47 +305,31 @@ def test_stream_uses_continuation_token_across_batches(spark, bigtable_ready):
         .options(**stream_options)
         .load()
     )
-    query = (
-        changes.writeStream.format("memory")
-        .queryName(query_name)
-        .outputMode("append")
-        .trigger(processingTime=trigger_interval)
-        .start()
-    )
 
-    stream_thread = threading.Thread(target=lambda: query.awaitTermination(), daemon=False)
-    stream_thread.start()
-    time.sleep(5)
+    with _running_memory_stream(changes, query_name):
+        # First batch: write first row
+        write_synthetic_mutations(
+            project_id=project_id,
+            instance_id=instance_id,
+            table_id=table_id,
+            column_family=column_family,
+            count=3,
+            row_key=b"continuation-token-row-1",
+            column=b"payload",
+        )
+        time.sleep(wait_after_writes)
 
-    # First batch: write first row
-    write_synthetic_mutations(
-        project_id=project_id,
-        instance_id=instance_id,
-        table_id=table_id,
-        column_family=column_family,
-        count=3,
-        row_key=b"continuation-token-row-1",
-        column=b"payload",
-    )
-    time.sleep(wait_after_writes)
-
-    # Second batch: write second row (reader should use continuation token from first batch)
-    write_synthetic_mutations(
-        project_id=project_id,
-        instance_id=instance_id,
-        table_id=table_id,
-        column_family=column_family,
-        count=3,
-        row_key=b"continuation-token-row-2",
-        column=b"payload",
-    )
-    time.sleep(wait_after_writes)
-
-    try:
-        query.stop()
-    except Exception:
-        pass
-    stream_thread.join(timeout=10)
+        # Second batch: write second row (reader should use continuation token from first batch)
+        write_synthetic_mutations(
+            project_id=project_id,
+            instance_id=instance_id,
+            table_id=table_id,
+            column_family=column_family,
+            count=3,
+            row_key=b"continuation-token-row-2",
+            column=b"payload",
+        )
+        time.sleep(wait_after_writes)
 
     result = spark.table(query_name)
     rows = result.collect()
@@ -353,7 +350,7 @@ def test_stateful_processor_reconstructs_record_from_change_stream(spark, bigtab
     """
     Read Bigtable change stream, run transformWithState(BigtableReconstructProcessor),
     write synthetic data to a dedicated row, then assert we see a reconstructed record
-    (row_key + record map of column_family -> latest value) for that row.
+    (row_key + record map of "column_family:column_qualifier" -> latest value) for that row.
     """
     config = bigtable_ready
     project_id = config["project_id"]
@@ -382,8 +379,6 @@ def test_stateful_processor_reconstructs_record_from_change_stream(spark, bigtab
     }
 
     query_name = "bt_stateful_reconstruct"
-    # Use longer trigger; one micro-batch can take ~90s with many partitions (tablets)
-    trigger_interval = "15 seconds"
     wait_after_writes = 120
     row_key = b"stateful-reconstruct-row"
 
@@ -410,50 +405,33 @@ def test_stateful_processor_reconstructs_record_from_change_stream(spark, bigtab
             timeMode="None",
         )
     )
-    query = (
-        reconstructed.writeStream.format("memory")
-        .queryName(query_name)
-        .outputMode("update")
-        .trigger(processingTime=trigger_interval)
-        .start()
-    )
 
-    def run_stream():
-        query.awaitTermination()
+    # Longer trigger/join: one micro-batch can take ~90s with many partitions (tablets).
+    with _running_memory_stream(
+        reconstructed, query_name, output_mode="update", trigger="15 seconds", join_timeout=30
+    ):
+        # Write to our dedicated row so change stream delivers SET_CELL for this row_key
+        write_synthetic_mutations(
+            project_id=project_id,
+            instance_id=instance_id,
+            table_id=table_id,
+            column_family=column_family,
+            count=3,
+            row_key=row_key,
+            column=b"payload",
+        )
 
-    stream_thread = threading.Thread(target=run_stream, daemon=False)
-    stream_thread.start()
-    time.sleep(5)
-
-    # Write to our dedicated row so change stream delivers SET_CELL for this row_key
-    write_synthetic_mutations(
-        project_id=project_id,
-        instance_id=instance_id,
-        table_id=table_id,
-        column_family=column_family,
-        count=3,
-        row_key=row_key,
-        column=b"payload",
-    )
-
-    # Poll until at least one batch has committed (stateful batch can take ~90s with many partitions)
-    for _ in range(wait_after_writes // 5):
-        time.sleep(5)
-        try:
-            n = spark.table(query_name).count()
-            if n >= 1:
-                break
-        except Exception:
-            pass
-    else:
-        time.sleep(5)
-
-    # Stop only after we've seen output or after full wait (reduces chance of interrupting checkpoint)
-    try:
-        query.stop()
-    except Exception:
-        pass
-    stream_thread.join(timeout=30)
+        # Poll until at least one batch has committed (stateful batch can take ~90s with many partitions)
+        for _ in range(wait_after_writes // 5):
+            time.sleep(5)
+            try:
+                n = spark.table(query_name).count()
+                if n >= 1:
+                    break
+            except Exception:
+                pass
+        else:
+            time.sleep(5)
 
     result = spark.table(query_name)
     rows = result.collect()
@@ -468,15 +446,18 @@ def test_stateful_processor_reconstructs_record_from_change_stream(spark, bigtab
     our_rows = [r for r in rows if r.row_key == row_key]
     if len(our_rows) >= 1:
         r = our_rows[0]
+        # write_synthetic_mutations writes column=b"payload", so the reconstructed
+        # record key is "column_family:column_qualifier" = f"{column_family}:payload".
+        record_key = f"{column_family}:payload"
         assert hasattr(r, "record"), "Reconstructed row should have 'record' field"
-        assert isinstance(r.record, dict), "record should be a dict (column_family -> value)"
-        assert column_family in r.record, (
-            f"record should contain column family {column_family!r}, keys: {list(r.record.keys())!r}"
+        assert isinstance(r.record, dict), "record should be a dict ('family:qualifier' -> value)"
+        assert record_key in r.record, (
+            f"record should contain {record_key!r}, keys: {list(r.record.keys())!r}"
         )
-        assert len(r.record[column_family]) >= 1, "record[column_family] should be non-empty"
-        assert b"integration-test-" in r.record[column_family], (
-            f"record[{column_family!r}] should contain integration-test- prefix, "
-            f"got: {r.record[column_family][:80]!r}..."
+        assert len(r.record[record_key]) >= 1, f"record[{record_key!r}] should be non-empty"
+        assert b"integration-test-" in r.record[record_key], (
+            f"record[{record_key!r}] should contain integration-test- prefix, "
+            f"got: {r.record[record_key][:80]!r}..."
         )
     else:
         # Our row may be in a partition that did not complete; still assert schema on any row
@@ -533,15 +514,17 @@ def test_stateful_processor_initial_state_load_from_dataframe(spark, bigtable_re
     }
 
     query_name = "bt_stateful_initial_load"
-    trigger_interval = "5 seconds"
     row_key = b"initial-load-row"
 
-    # Initial state: one row with two "column families" in record. We use the real
-    # column_family (will be overwritten by stream) and a synthetic key only in initial
-    # state; the stream never writes to the latter, so it proves initial state was loaded.
+    # Initial state: one row with two columns in record (keys are "family:qualifier").
+    # stream_record_key matches what the stream writes (column=b"payload") and will be
+    # overwritten; initial_only_key is never written by the stream, so its presence in
+    # the output proves initial state was loaded.
+    stream_record_key = f"{column_family}:payload"
+    initial_only_key = "cf_initial_only:seed"
     initial_record = {
-        column_family: b"preloaded-will-be-overwritten",
-        "cf_initial_only": b"from-initial-state",
+        stream_record_key: b"preloaded-will-be-overwritten",
+        initial_only_key: b"from-initial-state",
     }
     initial_state_df = spark.createDataFrame(
         [Row(row_key=row_key, record=initial_record)],
@@ -571,52 +554,34 @@ def test_stateful_processor_initial_state_load_from_dataframe(spark, bigtable_re
             initialState=initial_state_grouped,
         )
     )
-    query = (
-        reconstructed.writeStream.format("memory")
-        .queryName(query_name)
-        .outputMode("update")
-        .trigger(processingTime=trigger_interval)
-        .start()
-    )
-
-    def run_stream():
-        query.awaitTermination()
-
-    stream_thread = threading.Thread(target=run_stream, daemon=False)
-    stream_thread.start()
     # Let the first micro-batch run with only initial state (no stream data for our key yet),
-    # so handleInitialState runs before handleInputRows for this key.
-    # The first stateful batch takes ~15s (RocksDB + shuffle overhead), so wait long enough
-    # for it to complete before writing mutations.
-    time.sleep(20)
+    # so handleInitialState runs before handleInputRows for this key. The first stateful
+    # batch takes ~15s (RocksDB + shuffle overhead), so startup_sleep waits it out before
+    # writing mutations.
+    with _running_memory_stream(
+        reconstructed, query_name, output_mode="update", startup_sleep=20, join_timeout=30
+    ):
+        write_synthetic_mutations(
+            project_id=project_id,
+            instance_id=instance_id,
+            table_id=table_id,
+            column_family=column_family,
+            count=3,
+            row_key=row_key,
+            column=b"payload",
+        )
 
-    write_synthetic_mutations(
-        project_id=project_id,
-        instance_id=instance_id,
-        table_id=table_id,
-        column_family=column_family,
-        count=3,
-        row_key=row_key,
-        column=b"payload",
-    )
+        # Wait for at least one row so we don't stop the query mid-batch (avoids interrupting
+        # RocksDB state commit and MicroBatchWrite abort). Stream is repartitioned to
+        # spark.sql.shuffle.partitions so batches complete in reasonable time.
+        rows = _wait_for_stream_rows(
+            spark, query_name, min_rows=1, timeout_seconds=120, poll_interval=3
+        )
 
-    # Wait for at least one row so we don't stop the query mid-batch (avoids interrupting
-    # RocksDB state commit and MicroBatchWrite abort). Stream is repartitioned to
-    # spark.sql.shuffle.partitions so batches complete in reasonable time.
-    rows = _wait_for_stream_rows(
-        spark, query_name, min_rows=1, timeout_seconds=120, poll_interval=3
-    )
-
-    # Allow the in-flight batch to finish committing before stopping
-    # (reduces chance of InterruptedException during RocksDB zip).
-    if rows:
-        time.sleep(5)
-
-    try:
-        query.stop()
-    except Exception:
-        pass
-    stream_thread.join(timeout=30)
+        # Allow the in-flight batch to finish committing before stopping
+        # (reduces chance of InterruptedException during RocksDB zip).
+        if rows:
+            time.sleep(5)
 
     if rows is None:
         result = spark.table(query_name)
@@ -631,21 +596,120 @@ def test_stateful_processor_initial_state_load_from_dataframe(spark, bigtable_re
     if len(our_rows) >= 1:
         r = our_rows[0]
         assert hasattr(r, "record") and isinstance(r.record, dict)
-        # Stream updated this column family
-        assert column_family in r.record, (
-            f"record should contain column family {column_family!r}, keys: {list(r.record.keys())!r}"
+        # Stream updated this column
+        assert stream_record_key in r.record, (
+            f"record should contain {stream_record_key!r}, keys: {list(r.record.keys())!r}"
         )
-        assert b"integration-test-" in r.record[column_family], (
-            f"record[{column_family!r}] should reflect stream write, got: {r.record[column_family][:80]!r}..."
+        assert b"integration-test-" in r.record[stream_record_key], (
+            f"record[{stream_record_key!r}] should reflect stream write, "
+            f"got: {r.record[stream_record_key][:80]!r}..."
         )
         # Initial state had this key; stream never writes to it, so it must come from initial load
-        assert "cf_initial_only" in r.record, (
-            "record should contain cf_initial_only from initial state (proves initial load was applied)"
+        assert initial_only_key in r.record, (
+            f"record should contain {initial_only_key!r} from initial state "
+            "(proves initial load was applied)"
         )
-        assert r.record["cf_initial_only"] == b"from-initial-state", (
-            f"cf_initial_only should be from initial state, got {r.record['cf_initial_only']!r}"
+        assert r.record[initial_only_key] == b"from-initial-state", (
+            f"{initial_only_key!r} should be from initial state, got {r.record[initial_only_key]!r}"
         )
     else:
         r = rows[0]
         assert hasattr(r, "row_key") and hasattr(r, "record")
         assert isinstance(r.record, dict)
+
+
+@pytest.mark.integration
+def test_stream_reads_across_multiple_partitions_presplit_table(spark, bigtable_config):
+    """
+    Verify the reader discovers and reads MULTIPLE change-stream partitions in parallel,
+    end-to-end against real Bigtable, using a pre-split table.
+
+    Cloud Bigtable exposes no API to force a mid-stream tablet split on demand, so a live
+    CloseStream / continuation-token event cannot be triggered deterministically here. That
+    path (adopting successor partitions when an active partition closes) is covered by unit
+    tests in test_stream_reader.py — test_read_partition_chunk_returns_successors_on_close_stream
+    and test_latest_offset_handles_split_registers_successors. This test gives the closest
+    realistic coverage: a table pre-split into multiple tablets yields multiple change-stream
+    partitions, exercising _fetch_partition_metadata, the parallel per-partition reads, and
+    per-partition offsets against the real client.
+    """
+    from google.cloud.bigtable import Client
+    from tests.bigtable_integration_utils import (
+        delete_table_if_exists,
+        ensure_instance,
+        recreate_table,
+    )
+
+    project_id = bigtable_config["project_id"]
+    instance_id = bigtable_config["instance_id"]
+    region = bigtable_config["region"]
+    column_family = bigtable_config["column_family"]
+    split_table_id = f"{bigtable_config['table_id']}-split"
+    left_key = b"a-left-row"
+    right_key = b"z-right-row"
+
+    # Pre-split at b"m": row keys < "m" land in tablet 1, >= "m" in tablet 2 -> 2 partitions.
+    client = Client(project=project_id, admin=True)
+    ensure_instance(client, instance_id, region)
+    recreate_table(client, instance_id, split_table_id, column_family, initial_splits=[b"m"])
+    client.close()
+
+    try:
+        start_dt = datetime.now(timezone.utc)
+        start_timestamp_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        stream_options = {
+            "project_id": project_id,
+            "instance_id": instance_id,
+            "table_id": split_table_id,
+            "app_profile_id": "default",
+            "max_rows_per_partition": "5000",
+            "start_timestamp": start_timestamp_iso,
+            "heartbeat_duration_seconds": "1",
+            "empty_heartbeat_limit": "2",
+        }
+        query_name = "bt_changes_multi_partition"
+
+        changes = (
+            spark.readStream.format("bigtable_changes")
+            .options(**stream_options)
+            .load()
+        )
+        with _running_memory_stream(changes, query_name):
+            # Write to rows on both sides of the split key so events come from both partitions.
+            for rk in (left_key, right_key):
+                write_synthetic_mutations(
+                    project_id=project_id,
+                    instance_id=instance_id,
+                    table_id=split_table_id,
+                    column_family=column_family,
+                    count=2,
+                    row_key=rk,
+                    column=b"payload",
+                )
+
+            # Wait until events from BOTH sides arrive (delivery is async and per-partition),
+            # not just until a row count is hit.
+            rows = _wait_for_row_keys(
+                spark, query_name, [left_key, right_key], timeout_seconds=90, poll_interval=3
+            )
+    finally:
+        # Tear down the pre-split table so it does not linger (cost) between runs.
+        cleanup_client = Client(project=project_id, admin=True)
+        try:
+            delete_table_if_exists(cleanup_client, instance_id, split_table_id)
+        finally:
+            cleanup_client.close()
+
+    left = [r for r in rows if bytes(r.row_key) == left_key]
+    right = [r for r in rows if bytes(r.row_key) == right_key]
+    assert left and right, (
+        f"Expected events from both sides of the split; got left={len(left)}, right={len(right)}."
+    )
+    # Events must span more than one change-stream partition (distinct partition ranges).
+    # BinaryType columns come back as bytearray (unhashable), so convert to bytes.
+    partition_ranges = {
+        (bytes(r.partition_start_key), bytes(r.partition_end_key)) for r in rows
+    }
+    assert len(partition_ranges) >= 2, (
+        f"Expected events from >=2 change-stream partitions, saw ranges: {partition_ranges}."
+    )

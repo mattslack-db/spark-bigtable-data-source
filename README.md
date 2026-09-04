@@ -87,7 +87,7 @@ changes = spark.readStream \
 
 ### Reconstruct full records with transformWithState
 
-The **stateful processor** reconstructs the latest row state per `row_key` from the change stream: it keeps a map of **column_family → latest value** in state and emits one row `(row_key, record)` on every change. Use `BigtableReconstructProcessor` and `RECONSTRUCTED_RECORD_SCHEMA` from `bigtable_stateful_processor`. **Requires Spark 4.x** and a RocksDB state store (e.g. Databricks Runtime with `transformWithState` support).
+The **stateful processor** reconstructs the latest row state per `row_key` from the change stream: it keeps a map of **`column_family:column_qualifier` → latest value** in state and emits one row `(row_key, record)` on every change (so distinct qualifiers in the same family are tracked independently, and a `DELETE_COLUMN` removes only that column). Use `BigtableReconstructProcessor` and `RECONSTRUCTED_RECORD_SCHEMA` from `bigtable_stateful_processor`. **Requires Spark 4.x** and a RocksDB state store (e.g. Databricks Runtime with `transformWithState` support).
 
 ```python
 spark.conf.set(

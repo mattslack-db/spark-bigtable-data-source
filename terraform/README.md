@@ -1,6 +1,8 @@
 # Bigtable demo infrastructure (Terraform)
 
-Creates a **DEVELOPMENT** Bigtable instance and a table with **change stream** enabled (7-day retention) and column families `cf1` and `cf2` for the `notebooks/stream-demo` and stateful-processor notebooks.
+Creates a **PRODUCTION** Bigtable instance (a single HDD node — the recommended low-cost option, since the DEVELOPMENT instance type is deprecated) and a table with **change stream** enabled (7-day retention) and column families `cf1` and `cf2` for the `notebooks/stream-demo` and stateful-processor notebooks.
+
+> **Cost:** a PRODUCTION node bills continuously per node-hour whether or not it is used. Run `terraform destroy` (see below) when you are done with the demo to stop the charge.
 
 ## Prerequisites
 

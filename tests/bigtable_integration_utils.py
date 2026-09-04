@@ -77,14 +77,23 @@ def ensure_instance(client, instance_id: str, region: str) -> None:
     operation.result(timeout=600)
 
 
-def ensure_table(client, instance_id: str, table_id: str, column_family: str) -> None:
+def ensure_table(
+    client,
+    instance_id: str,
+    table_id: str,
+    column_family: str,
+    initial_splits: list[bytes] | None = None,
+) -> None:
     """Create Bigtable table with change stream if it does not exist.
 
-    No initial splits are set, so a newly created table starts with one tablet
-    (one change-stream partition). Tables that already exist may have many tablets
-    from prior writes (Bigtable auto-splits as data grows), which increases
-    partition count and micro-batch time. For faster integration tests, use a
-    dedicated table id (e.g. integration-test) that ensure_table creates fresh.
+    With no ``initial_splits`` a newly created table starts with one tablet (one
+    change-stream partition). Passing ``initial_splits`` pre-splits the table into
+    ``len(initial_splits) + 1`` tablets — and thus that many change-stream partitions —
+    which is the closest an integration test can get to a post-split topology (Cloud
+    Bigtable does not expose an API to force a split of an existing tablet on demand).
+    Tables that already exist may have many tablets from prior writes (Bigtable
+    auto-splits as data grows), which increases partition count and micro-batch time.
+    For faster integration tests, use a dedicated table id that ensure_table creates fresh.
     """
     from google.cloud.bigtable_admin_v2.types import bigtable_table_admin
     from google.cloud.bigtable_admin_v2.types import table as gba_table
@@ -106,19 +115,24 @@ def ensure_table(client, instance_id: str, table_id: str, column_family: str) ->
         column_families={column_family: gba_table.ColumnFamily()},
         change_stream_config=change_stream_config,
     )
+    splits = [
+        bigtable_table_admin.CreateTableRequest.Split(key=k)
+        for k in (initial_splits or [])
+    ]
     request = bigtable_table_admin.CreateTableRequest(
         parent=parent,
         table_id=table_id,
         table=table_pb,
+        initial_splits=splits,
     )
     table_client.create_table(request=request)
 
 
-def recreate_table(client, instance_id: str, table_id: str, column_family: str) -> None:
-    """Delete the table if it exists, then create it with change stream (one tablet, no splits).
+def delete_table_if_exists(client, instance_id: str, table_id: str) -> None:
+    """Delete a table if it exists, disabling its change stream first.
 
     Bigtable does not allow deleting a table while its change stream is enabled,
-    so we disable the change stream first via UpdateTable, then delete, then create.
+    so we disable the change stream via UpdateTable, then delete.
     """
     from google.cloud.bigtable_admin_v2.types import bigtable_table_admin
     from google.cloud.bigtable_admin_v2.types import table as gba_table
@@ -126,17 +140,31 @@ def recreate_table(client, instance_id: str, table_id: str, column_family: str) 
 
     instance = client.instance(instance_id)
     table_obj = instance.table(table_id)
-    if table_obj.exists():
-        table_client = client.table_admin_client
-        # Disable change stream so the table can be deleted.
-        update_request = bigtable_table_admin.UpdateTableRequest(
-            table=gba_table.Table(name=table_obj.name),
-            update_mask=field_mask_pb2.FieldMask(paths=["change_stream_config"]),
-        )
-        operation = table_client.update_table(request=update_request)
-        operation.result(timeout=120)
-        table_obj.delete()
-    ensure_table(client, instance_id, table_id, column_family)
+    if not table_obj.exists():
+        return
+    table_client = client.table_admin_client
+    update_request = bigtable_table_admin.UpdateTableRequest(
+        table=gba_table.Table(name=table_obj.name),
+        update_mask=field_mask_pb2.FieldMask(paths=["change_stream_config"]),
+    )
+    operation = table_client.update_table(request=update_request)
+    operation.result(timeout=120)
+    table_obj.delete()
+
+
+def recreate_table(
+    client,
+    instance_id: str,
+    table_id: str,
+    column_family: str,
+    initial_splits: list[bytes] | None = None,
+) -> None:
+    """Delete the table if it exists, then create it with change stream.
+
+    Optionally pre-split into multiple tablets via ``initial_splits`` (see ensure_table).
+    """
+    delete_table_if_exists(client, instance_id, table_id)
+    ensure_table(client, instance_id, table_id, column_family, initial_splits=initial_splits)
 
 
 def write_synthetic_mutations(

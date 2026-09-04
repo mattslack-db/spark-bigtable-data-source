@@ -17,6 +17,7 @@ class BigtableChangeStreamDataSource(DataSource):
         return "bigtable_changes"
 
     def __init__(self, options: Dict[str, Any]) -> None:
+        super().__init__(options)
         self.options = options
 
     def schema(self) -> StructType:

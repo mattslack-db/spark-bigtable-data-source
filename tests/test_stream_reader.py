@@ -791,3 +791,203 @@ def test_fetch_partition_metadata(basic_options):
     assert partitions[0].start_key == b"\x00\x01"
     assert partitions[0].end_key == b"\x00\x02"
     assert 0 in reader._partitions
+
+
+# ─── gRPC stream cancellation (connection-pool safety) ──────────────────────
+
+
+class _FakeStream:
+    """Iterable gRPC-stream stand-in that records cancel() calls."""
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.cancel = MagicMock()
+
+    def __iter__(self):
+        return iter(self._responses)
+
+
+def _heartbeat_response(token="tok"):
+    hb = MagicMock()
+    hb.estimated_low_watermark = None
+    hb.continuation_token = MagicMock()
+    hb.continuation_token.token = token
+    r = MagicMock()
+    r.heartbeat = hb
+    r.close_stream = None
+    r.data_change = None
+    return r
+
+
+def _close_response():
+    """A change-stream response whose CloseStream oneof is set (tablet split/merge)."""
+    r = MagicMock()
+    r.heartbeat = None
+    r.close_stream = MagicMock()
+    r.data_change = None
+    return r
+
+
+def test_read_partition_chunk_cancels_stream_on_break(basic_options):
+    """The server-streaming call is cancelled when the loop breaks early."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._tokens = {0: None}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"", b"\xff\xff", None)
+
+    # 3 heartbeats with no data -> loop breaks (empty_heartbeat_limit default 3).
+    stream = _FakeStream([_heartbeat_response() for _ in range(3)])
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = MagicMock(
+        return_value=stream
+    )
+
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        rows, new_token = reader._read_partition_chunk(partition)
+
+    stream.cancel.assert_called_once()
+    assert rows == []
+
+
+def test_read_partition_chunk_raises_on_close_stream(basic_options):
+    """CloseStream (tablet split/merge) fails loudly instead of looping on a dead partition."""
+    from bigtable_data_source.stream_reader import (
+        BigtableStreamReader,
+        ChangeStreamPartitionClosed,
+    )
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._tokens = {0: "old-token"}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"a", b"m", None)
+
+    stream = _FakeStream([_close_response()])
+    mock_table = MagicMock()
+    mock_table.name = "projects/p/instances/i/tables/t"
+    mock_table._instance._client.table_data_client.read_change_stream = MagicMock(
+        return_value=stream
+    )
+
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
+        with pytest.raises(ChangeStreamPartitionClosed, match="partition 0 closed"):
+            reader._read_partition_chunk(partition)
+
+    # The stream is still cancelled on the way out.
+    stream.cancel.assert_called_once()
+
+
+def test_latest_offset_propagates_partition_closed(basic_options):
+    """A closed partition makes latestOffset raise, so the batch fails and the query restarts."""
+    from bigtable_data_source.stream_reader import (
+        BigtableStreamReader,
+        ChangeStreamPartitionClosed,
+    )
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._initial_offset_completed = True
+    reader._partitions = {0: BigtablePartition(0, b"a", b"m", None)}
+    reader._tokens = {0: None}
+    reader._raw_partitions = {0: MagicMock()}
+
+    def fake_chunk(partition):
+        raise ChangeStreamPartitionClosed("partition 0 closed")
+
+    with patch.object(reader, "_get_client", return_value=(MagicMock(), MagicMock())):
+        with patch.object(reader, "_read_partition_chunk", side_effect=fake_chunk):
+            with pytest.raises(ChangeStreamPartitionClosed):
+                reader.latestOffset()
+
+
+def test_read_partition_chunk_swallows_errors_when_stopped(basic_options):
+    """After stop(), an error from an in-flight read is swallowed instead of crashing."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    reader._stopped = True  # simulate a stop() during the batch
+    reader._tokens = {0: "prev-token"}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"a", b"m", None)
+
+    # A read call is short-circuited by the _stopped check before touching the client.
+    rows, new_token = reader._read_partition_chunk(partition)
+    assert rows == []
+    assert new_token == "prev-token"
+
+
+def test_reader_is_picklable(basic_options):
+    """Spark serializes the reader to executors; the lock/client must not block pickling."""
+    import pickle
+
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    # Simulate mid-run state (partitions/tokens discovered).
+    reader._partitions = {0: BigtablePartition(0, b"a", b"m", None)}
+    reader._tokens = {0: "tok"}
+
+    restored = pickle.loads(pickle.dumps(reader))
+
+    assert restored.project_id == reader.project_id
+    assert restored._tokens == {0: "tok"}
+    # Runtime-only attributes are recreated on unpickle.
+    assert restored._client is None
+    assert restored._table is None
+    assert restored._active_streams == set()
+    # The recreated lock is usable.
+    with restored._lock:
+        pass
+
+
+def test_reader_picklable_after_client_created(basic_options):
+    """Even with a (non-picklable) client set, the reader still pickles."""
+    import pickle
+
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    reader._client = MagicMock()  # stand-in for a live, unpicklable Bigtable client
+    reader._table = MagicMock()
+    reader._active_streams.add(MagicMock())
+
+    restored = pickle.loads(pickle.dumps(reader))
+    assert restored._client is None
+    assert restored._active_streams == set()
+
+
+def test_stop_cancels_active_streams(basic_options):
+    """stop() cancels in-flight streams so worker reads abort promptly."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    reader._client = MagicMock()
+    stream = MagicMock()
+    reader._active_streams.add(stream)
+
+    reader.stop()
+
+    stream.cancel.assert_called_once()
+    assert reader._active_streams == set()
+    assert reader._stopped is True
+
+
+def test_stop_marks_stopped_and_clears_client(basic_options):
+    """stop() flags the reader stopped and releases the client reference."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    reader._client = MagicMock()
+    reader._table = MagicMock()
+
+    reader.stop()
+
+    assert reader._stopped is True
+    assert reader._client is None
+    assert reader._table is None

@@ -31,6 +31,6 @@ output "env_export" {
     export BIGTABLE_INSTANCE_ID="${google_bigtable_instance.demo.name}"
     export BIGTABLE_TABLE_ID="${google_bigtable_table.demo.name}"
     export BIGTABLE_REGION="${var.region}"
-    export BIGTABLE_COLUMN_FAMILY="${var.column_families[0]}"
+    export BIGTABLE_COLUMN_FAMILY="${length(var.column_families) > 0 ? var.column_families[0] : ""}"
   EOT
 }
