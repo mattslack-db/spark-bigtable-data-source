@@ -178,6 +178,24 @@ class BigtableStreamReader:
         # In-flight gRPC streams, so stop() can cancel them promptly to abort reads.
         self._active_streams: set = set()
 
+    def __getstate__(self) -> dict:
+        # Spark pickles the reader to ship it to executors. The lock, the Bigtable
+        # client/table, and the in-flight stream set are runtime-only and not picklable
+        # (a threading lock and gRPC channels cannot be serialized); drop them here and
+        # recreate them in __setstate__. read() on the executor uses the rows carried on
+        # the partition, not these, so nothing is lost.
+        state = self.__dict__.copy()
+        for key in ("_lock", "_client", "_table", "_active_streams"):
+            state.pop(key, None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+        self._client = None
+        self._table = None
+        self._active_streams = set()
+
     def _validate_options(self, options: Mapping[str, Any]) -> None:
         required = ["project_id", "instance_id", "table_id"]
         missing = [opt for opt in required if opt not in options]

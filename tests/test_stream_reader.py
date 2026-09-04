@@ -921,6 +921,47 @@ def test_read_partition_chunk_swallows_errors_when_stopped(basic_options):
     assert new_token == "prev-token"
 
 
+def test_reader_is_picklable(basic_options):
+    """Spark serializes the reader to executors; the lock/client must not block pickling."""
+    import pickle
+
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+    from bigtable_data_source.partitioning import BigtablePartition
+
+    reader = BigtableStreamReader(basic_options)
+    # Simulate mid-run state (partitions/tokens discovered).
+    reader._partitions = {0: BigtablePartition(0, b"a", b"m", None)}
+    reader._tokens = {0: "tok"}
+
+    restored = pickle.loads(pickle.dumps(reader))
+
+    assert restored.project_id == reader.project_id
+    assert restored._tokens == {0: "tok"}
+    # Runtime-only attributes are recreated on unpickle.
+    assert restored._client is None
+    assert restored._table is None
+    assert restored._active_streams == set()
+    # The recreated lock is usable.
+    with restored._lock:
+        pass
+
+
+def test_reader_picklable_after_client_created(basic_options):
+    """Even with a (non-picklable) client set, the reader still pickles."""
+    import pickle
+
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    reader._client = MagicMock()  # stand-in for a live, unpicklable Bigtable client
+    reader._table = MagicMock()
+    reader._active_streams.add(MagicMock())
+
+    restored = pickle.loads(pickle.dumps(reader))
+    assert restored._client is None
+    assert restored._active_streams == set()
+
+
 def test_stop_cancels_active_streams(basic_options):
     """stop() cancels in-flight streams so worker reads abort promptly."""
     from bigtable_data_source.stream_reader import BigtableStreamReader
