@@ -1,13 +1,14 @@
 """Bigtable Change Stream reader implementation."""
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Iterator, List, Mapping, Optional, Tuple
 
 from google.api_core import exceptions as google_api_exceptions
-from pyspark.sql.datasource import DataSourceStreamReader
+from pyspark.sql.datasource import DataSourceStreamReader, InputPartition
 
 from .mutation_types import MutationType
 from .partitioning import BigtablePartition
@@ -38,6 +39,50 @@ def _to_datetime_utc(ts: Any) -> Optional[datetime]:
     if hasattr(ts, "tzinfo") and ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts
+
+
+def _cancel_stream(stream: Any) -> None:
+    """Best-effort cancel of a gRPC server-streaming call.
+
+    A bare ``break`` out of a gRPC server-streaming iterator does NOT cancel the
+    call server-side; the channel slot stays occupied until the server deadline.
+    Calling cancel() frees it immediately. Safe to call if the stream is already
+    finished or does not support cancellation.
+    """
+    cancel = getattr(stream, "cancel", None)
+    if cancel is None:
+        return
+    try:
+        cancel()
+    except Exception:  # pragma: no cover - cancellation is best-effort
+        _LOG.debug("Ignoring error while cancelling change stream", exc_info=True)
+
+
+def _row_range_keys(raw_partition: Any) -> Tuple[bytes, bytes]:
+    """Extract (start_key_closed, end_key_open) bytes from a StreamPartition-like object."""
+    rr = getattr(raw_partition, "row_range", None)
+    if rr is None:
+        return b"", b""
+    start = getattr(rr, "start_key_closed", b"") or b""
+    end = getattr(rr, "end_key_open", b"") or b""
+    return bytes(start), bytes(end)
+
+
+def _extract_close_successors(close_stream: Any) -> List[Tuple[Any, Optional[str]]]:
+    """Extract (raw_partition, token) successors from a CloseStream message.
+
+    On a tablet split or merge, ``CloseStream.continuation_tokens`` describes the new
+    partition(s) and the token(s) to resume from. Returns an empty list when the
+    stream closed without successors (e.g. the change stream was dropped).
+    """
+    tokens = getattr(close_stream, "continuation_tokens", None) or []
+    successors: List[Tuple[Any, Optional[str]]] = []
+    for ct in tokens:
+        raw_partition = getattr(ct, "partition", None)
+        token = getattr(ct, "token", None)
+        if raw_partition is not None:
+            successors.append((raw_partition, token))
+    return successors
 
 
 class BigtableStreamReader:
@@ -130,10 +175,17 @@ class BigtableStreamReader:
         self._partitions: dict[int, BigtablePartition] = {}
         # partition_index → raw StreamPartition from API (for exact request match)
         self._raw_partitions: dict[int, object] = {}
+        # Monotonic counter for allocating new partition indices when tablets
+        # split/merge mid-stream (see _register_successor_partition). Never reused.
+        self._partition_counter: int = 0
 
-        self._client = None
-        self._table = None
+        self._client: Optional[Any] = None
+        self._table: Optional[Any] = None
         self._initial_offset_completed = False
+        # Guards client lifecycle so stop() cannot close the client while
+        # latestOffset()'s worker threads are still using it.
+        self._lock = threading.Lock()
+        self._stopped = False
 
     def _validate_options(self, options: Mapping[str, Any]) -> None:
         required = ["project_id", "instance_id", "table_id"]
@@ -217,30 +269,58 @@ class BigtableStreamReader:
         if not self._initial_offset_completed:
             _ = self._fetch_partition_metadata()
             self._initial_offset_completed = True
-        # Ensure client is created on this thread before parallel partition reads.
-        self._get_client()
-        self._buffered_rows = {}
-        new_offsets = {}
 
-        # Read partitions in parallel to avoid 200+ sequential network round-trips per batch.
-        max_workers = min(32, max(1, len(self._partitions)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
-                executor.submit(self._read_partition_chunk, partition): idx
-                for idx, partition in self._partitions.items()
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    rows, new_token = future.result()
-                except Exception as e:
-                    _LOG.exception("Partition %s read failed", idx)
-                    raise
-                self._buffered_rows[idx] = rows
-                new_offsets[str(idx)] = new_token
-                self._tokens[idx] = new_token
+        # Hold the lifecycle lock for the whole batch so stop() cannot close the
+        # client while the worker threads below are still reading from it.
+        with self._lock:
+            if self._stopped:
+                return {str(idx): tok for idx, tok in self._tokens.items()}
+            # Ensure the client is created before parallel partition reads.
+            self._get_client()
+            self._buffered_rows = {}
+            new_offsets: dict = {}
 
-        return new_offsets
+            # Snapshot the partition set; topology changes from splits/merges are
+            # applied only after the executor has drained.
+            partitions_snapshot = dict(self._partitions)
+            # Read partitions in parallel to avoid 200+ sequential round-trips per batch.
+            max_workers = min(32, max(1, len(partitions_snapshot)))
+            closed_indices: List[int] = []
+            pending_successors: List[Tuple[Any, Optional[str]]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(self._read_partition_chunk, partition): idx
+                    for idx, partition in partitions_snapshot.items()
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        rows, new_token, successors = future.result()
+                    except Exception:
+                        _LOG.exception("Partition %s read failed", idx)
+                        raise
+                    self._buffered_rows[idx] = rows
+                    if successors:
+                        # Partition closed (split/merge): drop it and adopt its
+                        # successors so data keeps flowing next micro-batch.
+                        closed_indices.append(idx)
+                        pending_successors.extend(successors)
+                    else:
+                        new_offsets[str(idx)] = new_token
+                        self._tokens[idx] = new_token
+
+            # Apply topology changes now that no worker is iterating the maps.
+            for idx in closed_indices:
+                self._partitions.pop(idx, None)
+                self._raw_partitions.pop(idx, None)
+                self._tokens.pop(idx, None)
+                new_offsets.pop(str(idx), None)
+            for raw_partition, token in pending_successors:
+                new_idx = self._register_successor_partition(raw_partition, token)
+                if new_idx is not None:
+                    new_offsets[str(new_idx)] = token
+
+            return new_offsets
 
     def partitions(self, start: dict, end: dict) -> List[BigtablePartition]:
         """
@@ -262,18 +342,14 @@ class BigtableStreamReader:
             )
         return result
 
-    def read(
-        self, partition: BigtablePartition
-    ) -> Union[Iterator[tuple], Iterator[Any]]:
+    def read(self, partition: InputPartition) -> Iterator[Tuple]:
         """
         Called on Spark executors. Yields rows from this partition.
-        Rows are carried on the partition object so they are available on the executor.
+
+        Rows are carried on the partition object (BigtablePartition.rows) so they are
+        available on the executor; driver-side buffers are not serialized to executors.
         """
-        rows = (
-            partition.rows
-            if hasattr(partition, "rows")
-            else self._buffered_rows.get(partition.partition_index, [])
-        )
+        rows = getattr(partition, "rows", [])
         for row in rows:
             yield (
                 row["row_key"],
@@ -292,10 +368,34 @@ class BigtableStreamReader:
         pass
 
     def stop(self) -> None:
-        if self._client is not None:
-            self._client.close()
+        # Serialize with latestOffset() so we never close the client out from under
+        # in-flight worker threads (which would surface as CANCELLED errors).
+        with self._lock:
+            self._stopped = True
+            if self._client is not None:
+                self._client.close()
+                self._client = None
+                self._table = None
 
     # -- Internal helpers --
+
+    def _data_client(self, table: Any) -> Any:
+        """Return the low-level Bigtable data client (gapic stub) for change stream RPCs.
+
+        NOTE: this reaches into private attributes of the google-cloud-bigtable client
+        because the change stream RPCs (GenerateInitialChangeStreamPartitions,
+        ReadChangeStream) are not exposed on the public Table API. The coupling is
+        centralised here so it lives in one place and fails with a clear, actionable
+        message if the library's internal layout changes across versions.
+        """
+        try:
+            return table._instance._client.table_data_client
+        except AttributeError as e:
+            raise RuntimeError(
+                "Could not access the Bigtable data client via "
+                "table._instance._client.table_data_client. The installed "
+                "google-cloud-bigtable version may have changed its internal layout."
+            ) from e
 
     def _fetch_partition_metadata(self) -> List[BigtablePartition]:
         """
@@ -303,7 +403,7 @@ class BigtableStreamReader:
         Uses the same partition layout the change stream API expects.
         """
         _, table = self._get_client()
-        data_client = table._instance._client.table_data_client
+        data_client = self._data_client(table)
         from google.cloud.bigtable_v2.types import GenerateInitialChangeStreamPartitionsRequest
 
         request = GenerateInitialChangeStreamPartitionsRequest(
@@ -328,14 +428,40 @@ class BigtableStreamReader:
             partitions.append(p)
             self._partitions[i] = p
             self._tokens[i] = None
+        # Next free index for successor partitions created by mid-stream splits/merges.
+        self._partition_counter = max(self._partitions, default=-1) + 1
         return partitions
+
+    def _register_successor_partition(
+        self, raw_partition: Any, token: Optional[str]
+    ) -> Optional[int]:
+        """Register a successor partition produced by a mid-stream split/merge.
+
+        Returns the new partition index, or None if a partition covering the same key
+        range is already active (dedup, e.g. both parents of a merge point at it).
+        """
+        start_key, end_key = _row_range_keys(raw_partition)
+        for existing in self._partitions.values():
+            if existing.start_key == start_key and existing.end_key == end_key:
+                return None
+        idx = self._partition_counter
+        self._partition_counter += 1
+        self._partitions[idx] = BigtablePartition(
+            partition_index=idx, start_key=start_key, end_key=end_key, token=token
+        )
+        self._raw_partitions[idx] = raw_partition
+        self._tokens[idx] = token
+        return idx
 
     def _read_partition_chunk(
         self, partition: BigtablePartition
-    ) -> tuple[list, Optional[str]]:
+    ) -> Tuple[list, Optional[str], List[Tuple[Any, Optional[str]]]]:
         """
         Calls ReadChangeStream for one partition, collects up to
-        max_rows_per_partition mutations, returns (rows, continuation_token).
+        max_rows_per_partition mutations, returns (rows, continuation_token, successors).
+
+        ``successors`` is non-empty only when the partition closed due to a tablet
+        split/merge; it carries the (raw_partition, token) pairs to resume from.
         """
         from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -388,59 +514,69 @@ class BigtableStreamReader:
                 now_ts.GetCurrentTime()
                 request["start_time"] = now_ts
 
-        data_client = table._instance._client.table_data_client
+        data_client = self._data_client(table)
+        successors: List[Tuple[Any, Optional[str]]] = []
 
         try:
             stream = data_client.read_change_stream(request=request)
+            try:
+                count = 0
+                heartbeats_without_data = 0
+                deadline = time.monotonic() + float(self.read_stream_timeout_seconds)
+                for response in stream:
+                    if time.monotonic() > deadline:
+                        _LOG.warning(
+                            "read_change_stream exceeded read_stream_timeout_seconds=%s "
+                            "for partition %s; breaking to avoid hanging the micro-batch",
+                            self.read_stream_timeout_seconds,
+                            partition.partition_index,
+                        )
+                        break
+                    # Proto-plus: check which oneof is set by truthiness (no HasField)
+                    if response.heartbeat:
+                        hb = response.heartbeat
+                        low_watermark = _to_datetime_utc(hb.estimated_low_watermark)
+                        new_token = hb.continuation_token.token if hb.continuation_token else None
+                        heartbeats_without_data += 1
+                        # End micro-batch at heartbeat if we have rows, or after N heartbeats with no data
+                        if count >= 1 or heartbeats_without_data >= self.empty_heartbeat_limit:
+                            break
 
-            count = 0
-            heartbeats_without_data = 0
-            deadline = time.monotonic() + float(self.read_stream_timeout_seconds)
-            for response in stream:
-                if time.monotonic() > deadline:
-                    _LOG.warning(
-                        "read_change_stream exceeded read_stream_timeout_seconds=%s "
-                        "for partition %s; breaking to avoid hanging the micro-batch",
-                        self.read_stream_timeout_seconds,
-                        partition.partition_index,
-                    )
-                    break
-                # Proto-plus: check which oneof is set by truthiness (no HasField)
-                if response.heartbeat:
-                    hb = response.heartbeat
-                    low_watermark = _to_datetime_utc(hb.estimated_low_watermark)
-                    new_token = hb.continuation_token.token if hb.continuation_token else None
-                    heartbeats_without_data += 1
-                    # End micro-batch at heartbeat if we have rows, or after N heartbeats with no data
-                    if count >= 1 or heartbeats_without_data >= self.empty_heartbeat_limit:
+                    elif response.close_stream:
+                        # Tablet split/merge: this partition no longer exists. Capture
+                        # the successor partitions from continuation_tokens so the reader
+                        # keeps consuming instead of silently re-requesting a dead
+                        # partition forever (which would drop all later mutations).
+                        successors = _extract_close_successors(response.close_stream)
+                        new_token = None
                         break
 
-                elif response.close_stream:
-                    new_token = None
-                    break
+                    elif response.data_change:
+                        dc = response.data_change
+                        commit_ts = _to_datetime_utc(dc.commit_timestamp)
+                        new_token = dc.token
+                        low_wm = (
+                            _to_datetime_utc(dc.estimated_low_watermark)
+                            if dc.estimated_low_watermark
+                            else low_watermark
+                        )
+                        row_key = bytes(dc.row_key) if dc.row_key else b""
 
-                elif response.data_change:
-                    dc = response.data_change
-                    commit_ts = _to_datetime_utc(dc.commit_timestamp)
-                    new_token = dc.token
-                    low_wm = (
-                        _to_datetime_utc(dc.estimated_low_watermark)
-                        if dc.estimated_low_watermark
-                        else low_watermark
-                    )
-                    row_key = bytes(dc.row_key) if dc.row_key else b""
+                        for chunk in dc.chunks:
+                            if chunk.mutation:
+                                mutation = self._parse_mutation(
+                                    chunk.mutation, row_key, commit_ts, low_wm, partition
+                                )
+                                if mutation:
+                                    rows.append(mutation)
+                                    count += 1
 
-                    for chunk in dc.chunks:
-                        if chunk.mutation:
-                            mutation = self._parse_mutation(
-                                chunk.mutation, row_key, commit_ts, low_wm, partition
-                            )
-                            if mutation:
-                                rows.append(mutation)
-                                count += 1
-
-                    if count >= self.max_rows_per_partition:
-                        break
+                        if count >= self.max_rows_per_partition:
+                            break
+            finally:
+                # Always cancel the server-streaming call so an early break does not
+                # leak the gRPC channel slot until the server deadline.
+                _cancel_stream(stream)
 
         except google_api_exceptions.Unauthenticated:
             _LOG.exception(
@@ -467,10 +603,15 @@ class BigtableStreamReader:
             )
             raise
 
-        return rows, new_token
+        return rows, new_token, successors
 
     def _parse_mutation(
-        self, mutation, row_key: bytes, commit_ts, low_wm, partition
+        self,
+        mutation: Any,
+        row_key: bytes,
+        commit_ts: Optional[datetime],
+        low_wm: Optional[datetime],
+        partition: BigtablePartition,
     ) -> Optional[dict]:
         """Converts a ReadChangeStream Mutation (from DataChange.chunks[].mutation) into a flat dict."""
         cf = ""
@@ -510,7 +651,10 @@ class BigtableStreamReader:
         }
 
 
-class BigtableChangeStreamReader(BigtableStreamReader, DataSourceStreamReader):
+# latestOffset uses the backward-compatible no-arg signature (start/limit were added in
+# Spark 4.2; Spark keeps the legacy form working — see DataSourceStreamReader.latestOffset).
+# mypy flags the mismatch across the two base classes; it is intentional and safe.
+class BigtableChangeStreamReader(BigtableStreamReader, DataSourceStreamReader):  # type: ignore[misc]
     """Streaming reader for Bigtable Change Streams."""
 
     pass
