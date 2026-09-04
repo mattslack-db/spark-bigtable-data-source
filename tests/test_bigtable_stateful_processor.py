@@ -100,6 +100,15 @@ def test_split_record_key_qualifier_with_separator():
     assert _split_record_key("cf1:a:b") == ("cf1", b"a:b")
 
 
+def test_compose_record_key_non_utf8_qualifier_raises():
+    """A non-UTF-8 qualifier fails fast instead of silently corrupting the record key."""
+    import pytest
+    from bigtable_stateful_processor.processor import _compose_record_key
+
+    with pytest.raises(ValueError, match="not valid.*UTF-8"):
+        _compose_record_key("cf1", b"\xff\xfe")
+
+
 # ─── _build_record_from_state ───────────────────────────────────────────────
 
 

@@ -163,8 +163,24 @@ def _as_str(value: Any) -> str:
 
 
 def _compose_record_key(family: str, qualifier: bytes) -> str:
-    """Build the output map key "family:qualifier"."""
-    return f"{family}{_RECORD_KEY_SEPARATOR}{_as_str(qualifier)}"
+    """Build the output map key "family:qualifier".
+
+    The record is a map<string, binary>, so the qualifier must become a string. Decode
+    it strictly as UTF-8 and fail fast on non-UTF-8 bytes rather than lossily replacing
+    them: a lossy decode could map two distinct binary qualifiers to the same key
+    (silent collision/corruption) and would not round-trip back to the original bytes.
+    """
+    if qualifier is None:
+        qualifier = b""
+    try:
+        qual_str = bytes(qualifier).decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"Column qualifier {bytes(qualifier)!r} in family {family!r} is not valid "
+            "UTF-8. BigtableReconstructProcessor represents record keys as "
+            "'column_family:column_qualifier' strings and requires UTF-8 qualifiers."
+        ) from e
+    return f"{family}{_RECORD_KEY_SEPARATOR}{qual_str}"
 
 
 def _split_record_key(record_key: str) -> Tuple[str, bytes]:

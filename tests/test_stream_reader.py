@@ -480,7 +480,7 @@ def test_read_partition_chunk_uses_start_timestamp_when_no_token(basic_options):
     mock_table._instance._client.table_data_client.read_change_stream = fake_read_change_stream
 
     with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
-        rows, new_token, _successors = reader._read_partition_chunk(partition)
+        rows, new_token = reader._read_partition_chunk(partition)
 
     assert captured_request is not None
     assert "start_time" in captured_request
@@ -561,7 +561,7 @@ def test_read_partition_chunk_uses_continuation_token_when_provided(basic_option
     mock_table._instance._client.table_data_client.read_change_stream = fake_read_change_stream
 
     with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
-        rows, new_token, _successors = reader._read_partition_chunk(partition)
+        rows, new_token = reader._read_partition_chunk(partition)
 
     assert captured_request is not None
     assert "continuation_tokens" in captured_request
@@ -642,7 +642,7 @@ def test_latest_offset_self_initializes_when_initial_offset_not_called(basic_opt
         with patch.object(
             reader,
             "_read_partition_chunk",
-            return_value=([], "token", []),
+            return_value=([], "token"),
         ):
             offsets = reader.latestOffset()
     mock_fetch.assert_called_once()
@@ -684,7 +684,7 @@ def test_read_partition_chunk_wall_clock_timeout(basic_options):
             "bigtable_data_source.stream_reader.time.monotonic",
             side_effect=[0.0, 0.0, 1e9],
         ):
-            rows, new_token, _successors = reader._read_partition_chunk(partition)
+            rows, new_token = reader._read_partition_chunk(partition)
     assert rows == []
     assert new_token == "tok"
 
@@ -760,7 +760,7 @@ def test_latest_offset_buffers_rows_and_returns_tokens(basic_options):
     with patch.object(
         reader,
         "_read_partition_chunk",
-        return_value=([one_row], "continuation-xyz", []),
+        return_value=([one_row], "continuation-xyz"),
     ):
         offsets = reader.latestOffset()
     assert offsets == {"0": "continuation-xyz"}
@@ -819,26 +819,11 @@ def _heartbeat_response(token="tok"):
     return r
 
 
-def _raw_partition(start, end):
-    raw = MagicMock()
-    raw.row_range.start_key_closed = start
-    raw.row_range.end_key_open = end
-    return raw
-
-
-def _close_response(continuation):
-    """continuation: list of (start, end, token) tuples describing successor partitions."""
-    close = MagicMock()
-    cts = []
-    for start, end, token in continuation:
-        ct = MagicMock()
-        ct.partition = _raw_partition(start, end)
-        ct.token = token
-        cts.append(ct)
-    close.continuation_tokens = cts
+def _close_response():
+    """A change-stream response whose CloseStream oneof is set (tablet split/merge)."""
     r = MagicMock()
     r.heartbeat = None
-    r.close_stream = close
+    r.close_stream = MagicMock()
     r.data_change = None
     return r
 
@@ -862,16 +847,18 @@ def test_read_partition_chunk_cancels_stream_on_break(basic_options):
     )
 
     with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
-        rows, new_token, successors = reader._read_partition_chunk(partition)
+        rows, new_token = reader._read_partition_chunk(partition)
 
     stream.cancel.assert_called_once()
     assert rows == []
-    assert successors == []
 
 
-def test_read_partition_chunk_returns_successors_on_close_stream(basic_options):
-    """CloseStream (split) yields successor (raw_partition, token) pairs, not a dead loop."""
-    from bigtable_data_source.stream_reader import BigtableStreamReader
+def test_read_partition_chunk_raises_on_close_stream(basic_options):
+    """CloseStream (tablet split/merge) fails loudly instead of looping on a dead partition."""
+    from bigtable_data_source.stream_reader import (
+        BigtableStreamReader,
+        ChangeStreamPartitionClosed,
+    )
     from bigtable_data_source.partitioning import BigtablePartition
 
     reader = BigtableStreamReader(basic_options)
@@ -879,9 +866,7 @@ def test_read_partition_chunk_returns_successors_on_close_stream(basic_options):
     reader._raw_partitions = {}
     partition = BigtablePartition(0, b"a", b"m", None)
 
-    stream = _FakeStream(
-        [_close_response([(b"a", b"g", "tok-1"), (b"g", b"m", "tok-2")])]
-    )
+    stream = _FakeStream([_close_response()])
     mock_table = MagicMock()
     mock_table.name = "projects/p/instances/i/tables/t"
     mock_table._instance._client.table_data_client.read_change_stream = MagicMock(
@@ -889,70 +874,67 @@ def test_read_partition_chunk_returns_successors_on_close_stream(basic_options):
     )
 
     with patch.object(reader, "_get_client", return_value=(MagicMock(), mock_table)):
-        rows, new_token, successors = reader._read_partition_chunk(partition)
+        with pytest.raises(ChangeStreamPartitionClosed, match="partition 0 closed"):
+            reader._read_partition_chunk(partition)
 
-    assert rows == []
-    assert new_token is None
-    assert len(successors) == 2
-    assert successors[0][1] == "tok-1"
-    assert successors[1][1] == "tok-2"
+    # The stream is still cancelled on the way out.
     stream.cancel.assert_called_once()
 
 
-def test_latest_offset_handles_split_registers_successors(basic_options):
-    """A split drops the closed partition and registers its successors as new partitions."""
-    from bigtable_data_source.stream_reader import BigtableStreamReader
+def test_latest_offset_propagates_partition_closed(basic_options):
+    """A closed partition makes latestOffset raise, so the batch fails and the query restarts."""
+    from bigtable_data_source.stream_reader import (
+        BigtableStreamReader,
+        ChangeStreamPartitionClosed,
+    )
     from bigtable_data_source.partitioning import BigtablePartition
 
     reader = BigtableStreamReader(basic_options)
     reader._initial_offset_completed = True
-    p0 = BigtablePartition(0, b"a", b"m", None)
-    p1 = BigtablePartition(1, b"m", b"", None)
-    reader._partitions = {0: p0, 1: p1}
-    reader._tokens = {0: None, 1: None}
-    reader._raw_partitions = {0: MagicMock(), 1: MagicMock()}
-    reader._partition_counter = 2
-
-    raw_a = _raw_partition(b"a", b"g")
-    raw_b = _raw_partition(b"g", b"m")
+    reader._partitions = {0: BigtablePartition(0, b"a", b"m", None)}
+    reader._tokens = {0: None}
+    reader._raw_partitions = {0: MagicMock()}
 
     def fake_chunk(partition):
-        if partition.partition_index == 0:
-            return ([], None, [(raw_a, "tok-a"), (raw_b, "tok-b")])
-        return ([], "tok-1", [])
+        raise ChangeStreamPartitionClosed("partition 0 closed")
 
     with patch.object(reader, "_get_client", return_value=(MagicMock(), MagicMock())):
         with patch.object(reader, "_read_partition_chunk", side_effect=fake_chunk):
-            offsets = reader.latestOffset()
-
-    # Closed partition 0 is gone from state and offsets.
-    assert 0 not in reader._partitions
-    assert "0" not in offsets
-    # Untouched partition 1 keeps its token.
-    assert reader._partitions[1] is p1
-    assert offsets["1"] == "tok-1"
-    # Successors registered at fresh indices with their tokens.
-    assert reader._partitions[2].start_key == b"a" and reader._partitions[2].end_key == b"g"
-    assert reader._partitions[3].start_key == b"g" and reader._partitions[3].end_key == b"m"
-    assert offsets["2"] == "tok-a"
-    assert offsets["3"] == "tok-b"
+            with pytest.raises(ChangeStreamPartitionClosed):
+                reader.latestOffset()
 
 
-def test_register_successor_partition_dedups_existing_range(basic_options):
-    """A successor whose key range is already active is not registered twice."""
+def test_read_partition_chunk_swallows_errors_when_stopped(basic_options):
+    """After stop(), an error from an in-flight read is swallowed instead of crashing."""
     from bigtable_data_source.stream_reader import BigtableStreamReader
     from bigtable_data_source.partitioning import BigtablePartition
 
     reader = BigtableStreamReader(basic_options)
-    reader._partitions = {0: BigtablePartition(0, b"a", b"g", None)}
-    reader._partition_counter = 1
+    reader._stopped = True  # simulate a stop() during the batch
+    reader._tokens = {0: "prev-token"}
+    reader._raw_partitions = {}
+    partition = BigtablePartition(0, b"a", b"m", None)
 
-    # Same range as the existing partition -> skipped.
-    assert reader._register_successor_partition(_raw_partition(b"a", b"g"), "t") is None
-    # A new range -> registered.
-    new_idx = reader._register_successor_partition(_raw_partition(b"g", b"z"), "t2")
-    assert new_idx == 1
-    assert reader._partitions[1].start_key == b"g"
+    # A read call is short-circuited by the _stopped check before touching the client.
+    rows, new_token = reader._read_partition_chunk(partition)
+    assert rows == []
+    assert new_token == "prev-token"
+
+
+def test_stop_cancels_active_streams(basic_options):
+    """stop() cancels in-flight streams so worker reads abort promptly."""
+    from bigtable_data_source.stream_reader import BigtableStreamReader
+
+    reader = BigtableStreamReader(basic_options)
+    reader._client = MagicMock()
+    stream = MagicMock()
+    reader._active_streams.add(stream)
+
+    reader.stop()
+
+    stream.cancel.assert_called_once()
+    assert reader._active_streams == set()
+    assert reader._stopped is True
 
 
 def test_stop_marks_stopped_and_clears_client(basic_options):
